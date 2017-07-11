@@ -29,9 +29,9 @@ def sync_hubspot_contact(user):
                 lifecyclestage='opportunity',
                 hubspot_owner_id=HUBSPOT_DOMIECK_OWNER_ID
             )
-        if user.source in ['wizard ']:
+        if user.source in ['wizard']:
             profile_kwargs.update({'tag': 'wizard call'})
-            
+
         create_hubspot_contact(user.email, firstname=user.first_name, lastname=user.last_name, **profile_kwargs)
 
 
