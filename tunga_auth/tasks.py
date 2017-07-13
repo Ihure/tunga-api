@@ -31,7 +31,6 @@ def sync_hubspot_contact(user):
             )
         if user.source in ['wizard']:
             profile_kwargs.update({'tag': 'wizard call'})
-
         create_hubspot_contact(user.email, firstname=user.first_name, lastname=user.last_name, **profile_kwargs)
 
 
