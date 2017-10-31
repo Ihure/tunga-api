@@ -1,19 +1,24 @@
-# encoding=utf8
+# -*- coding: utf-8 -*-
+
 from __future__ import unicode_literals
 
 import re
 import uuid
 from decimal import Decimal
 
+import datetime
 import tagulous.models
 from actstream.models import Action
+from dateutil.relativedelta import relativedelta
 from django.contrib.contenttypes.fields import GenericRelation, GenericForeignKey
 from django.contrib.contenttypes.models import ContentType
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
+from django.db.models.aggregates import Min
 from django.db.models.query_utils import Q
 from django.template.defaultfilters import floatformat, truncatewords
 from django.utils.crypto import get_random_string
+from django.utils.encoding import python_2_unicode_compatible
 from django.utils.html import strip_tags
 from django.utils.translation import ugettext_lazy as _
 from dry_rest_permissions.generics import allow_staff_or_superuser
@@ -26,6 +31,7 @@ from tunga_comments.models import Comment
 from tunga_messages.models import Channel
 from tunga_profiles.models import Skill, Connection
 from tunga_settings.models import VISIBILITY_CHOICES
+from tunga_utils import stripe_utils
 from tunga_utils.constants import CURRENCY_EUR, CURRENCY_USD, USER_TYPE_DEVELOPER, VISIBILITY_DEVELOPER, VISIBILITY_MY_TEAM, VISIBILITY_CUSTOM, UPDATE_SCHEDULE_HOURLY, UPDATE_SCHEDULE_DAILY, \
     UPDATE_SCHEDULE_WEEKLY, UPDATE_SCHEDULE_MONTHLY, UPDATE_SCHEDULE_QUATERLY, UPDATE_SCHEDULE_ANNUALLY, \
     TASK_PAYMENT_METHOD_BITONIC, TASK_PAYMENT_METHOD_BITCOIN, TASK_PAYMENT_METHOD_BANK, \
@@ -37,8 +43,12 @@ from tunga_utils.constants import CURRENCY_EUR, CURRENCY_USD, USER_TYPE_DEVELOPE
     TASK_TYPE_MOBILE, TASK_TYPE_OTHER, TASK_CODERS_NEEDED_ONE, TASK_CODERS_NEEDED_MULTIPLE, TASK_SCOPE_TASK, \
     TASK_SCOPE_ONGOING, TASK_BILLING_METHOD_FIXED, TASK_BILLING_METHOD_HOURLY, TASK_SCOPE_PROJECT, TASK_SOURCE_DEFAULT, \
     TASK_SOURCE_NEW_USER, PROGRESS_EVENT_TYPE_COMPLETE, STATUS_INITIAL, STATUS_APPROVED, STATUS_DECLINED, \
-    STATUS_ACCEPTED, STATUS_REJECTED, STATUS_SUBMITTED
-from tunga_utils.helpers import round_decimal, get_serialized_id, get_tunga_model
+    STATUS_ACCEPTED, STATUS_REJECTED, STATUS_SUBMITTED, PROGRESS_EVENT_TYPE_PM, PROGRESS_EVENT_TYPE_CLIENT, \
+    TASK_PAYMENT_METHOD_STRIPE, PROGRESS_REPORT_STATUS_BEHIND_BUT_PROGRESSING, PROGRESS_REPORT_STATUS_BEHIND_AND_STUCK, \
+    PROGRESS_REPORT_STUCK_REASON_ERROR, PROGRESS_REPORT_STUCK_REASON_POOR_DOC, PROGRESS_REPORT_STUCK_REASON_HARDWARE, \
+    PROGRESS_REPORT_STUCK_REASON_UNCLEAR_SPEC, PROGRESS_REPORT_STUCK_REASON_PERSONAL, PROGRESS_REPORT_STUCK_REASON_OTHER, \
+    STATUS_CANCELED
+from tunga_utils.helpers import round_decimal, get_serialized_id, get_tunga_model, get_edit_token_header
 from tunga_utils.models import Upload, Rating
 from tunga_utils.validators import validate_btc_address
 
@@ -62,7 +72,9 @@ UPDATE_SCHEDULE_CHOICES = (
 )
 
 
+@python_2_unicode_compatible
 class Project(models.Model):
+    # This model is deprecated ... the task model is now used for both tasks and projects
     user = models.ForeignKey(settings.AUTH_USER_MODEL, related_name='projects_created', on_delete=models.DO_NOTHING)
     title = models.CharField(max_length=200)
     description = models.TextField(blank=True, null=True)
@@ -74,7 +86,7 @@ class Project(models.Model):
     archived = models.BooleanField(default=False)
     archived_at = models.DateTimeField(blank=True, null=True)
 
-    def __unicode__(self):
+    def __str__(self):
         return self.title
 
     class Meta:
@@ -102,7 +114,8 @@ class Project(models.Model):
     @property
     def excerpt(self):
         try:
-            return strip_tags(self.description).strip()
+            if self.description:
+                return strip_tags(self.description).strip()
         except:
             return None
 
@@ -130,8 +143,9 @@ TASK_CODERS_NEEDED_CHOICES = (
 )
 
 TASK_PAYMENT_METHOD_CHOICES = (
-    (TASK_PAYMENT_METHOD_BITONIC, 'Pay with ideal / mister cash'),
-    (TASK_PAYMENT_METHOD_BITCOIN, 'Pay with bitcoin'),
+    (TASK_PAYMENT_METHOD_STRIPE, 'Pay with Stripe'),
+    (TASK_PAYMENT_METHOD_BITONIC, 'Pay with iDeal / mister cash'),
+    (TASK_PAYMENT_METHOD_BITCOIN, 'Pay with BitCoin'),
     (TASK_PAYMENT_METHOD_BANK, 'Pay by bank transfer')
 )
 
@@ -141,6 +155,100 @@ TASK_SOURCE_CHOICES = (
 )
 
 
+@python_2_unicode_compatible
+class MultiTaskPaymentKey(models.Model):
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.DO_NOTHING)
+    # Payment
+    currency = models.CharField(max_length=5, choices=CURRENCY_CHOICES, default=CURRENCY_CHOICES[0][0])
+    amount = models.DecimalField(
+        max_digits=19, decimal_places=4, blank=True, null=True, default=None
+    )
+    payment_method = models.CharField(
+        max_length=30, choices=TASK_PAYMENT_METHOD_CHOICES,
+        help_text=','.join(['%s - %s' % (item[0], item[1]) for item in TASK_PAYMENT_METHOD_CHOICES]),
+        blank=True, null=True
+    )
+    distribute_only = models.BooleanField(default=False, help_text='True if the task is paid')
+    btc_address = models.CharField(max_length=40, validators=[validate_btc_address])
+    btc_price = models.DecimalField(max_digits=18, decimal_places=8, blank=True, null=True)
+    withhold_tunga_fee = models.BooleanField(
+        default=False,
+        help_text='Only participant portion will be paid if True, '
+                  'and all money paid will be distributed to participants'
+    )
+    tax_rate = models.DecimalField(
+        max_digits=19, decimal_places=4, default=0
+    )
+    processing = models.BooleanField(default=False, help_text='True if the task is processing')
+    paid = models.BooleanField(default=False, help_text='True if the task is paid')
+
+    processing_at = models.DateTimeField(blank=True, null=True)
+    paid_at = models.DateTimeField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return 'Batch Payment #{}'.format(self.id)
+
+    class Meta:
+        ordering = ['created_at']
+
+    @staticmethod
+    @allow_staff_or_superuser
+    def has_read_permission(request):
+        return True
+
+    @allow_staff_or_superuser
+    def has_object_read_permission(self, request):
+        return request.user == self.user
+
+    @staticmethod
+    @allow_staff_or_superuser
+    def has_write_permission(request):
+        return request.user.is_project_owner
+
+    @staticmethod
+    @allow_staff_or_superuser
+    def has_create_permission(request):
+        return request.user.is_project_owner
+
+    @staticmethod
+    @allow_staff_or_superuser
+    def has_update_permission(request):
+        return True
+
+    @allow_staff_or_superuser
+    def has_object_write_permission(self, request):
+        return request.user == self.user
+
+    @property
+    def amount(self):
+        connected_tasks = self.distribute_only and self.distribute_tasks or self.tasks
+        return sum([task.pay for task in list(connected_tasks.all())])
+
+    @property
+    def pay(self):
+        if self.withhold_tunga_fee:
+            return self.pay_participants
+        return self.amount
+
+    @property
+    def tax_ratio(self):
+        return Decimal(self.tax_rate) * Decimal(0.01)
+
+    @property
+    def pay_participants(self):
+        connected_tasks = self.distribute_only and self.distribute_tasks or self.tasks
+        return sum([task.pay*Decimal(1 - task.tunga_ratio_dev) for task in list(connected_tasks.all())])
+
+    def get_task_share_ratio(self, task):
+        if (task.multi_pay_key_id == self.id and not self.distribute_only) or \
+                (task.multi_pay_distribute_key_id == self.id and self.distribute_only):
+            return task.pay/self.amount
+        return 0
+
+
+@python_2_unicode_compatible
 class Task(models.Model):
     user = models.ForeignKey(settings.AUTH_USER_MODEL, related_name='tasks_created', on_delete=models.DO_NOTHING)
     title = models.CharField(max_length=200, blank=True, null=True, default='')
@@ -157,9 +265,11 @@ class Task(models.Model):
         choices=TASK_BILLING_CHOICES, default=TASK_BILLING_METHOD_FIXED, blank=True, null=True
     )
     currency = models.CharField(max_length=5, choices=CURRENCY_CHOICES, default=CURRENCY_CHOICES[0][0])
+    # Amount placed on task by client
     fee = models.DecimalField(
         max_digits=19, decimal_places=4, blank=True, null=True, default=None
     )
+    # Created from developer estimate (hrs * rate/hr)
     bid = models.DecimalField(
         max_digits=19, decimal_places=4, blank=True, null=True, default=None
     )
@@ -169,14 +279,23 @@ class Task(models.Model):
     pm_rate = models.DecimalField(
         max_digits=19, decimal_places=4, default=39
     )
+    tax_rate = models.DecimalField(
+        max_digits=19, decimal_places=4, default=0
+    )
+    # Used to calculate PM hours given the development hrs
     pm_time_percentage = models.DecimalField(
         max_digits=7, decimal_places=4, default=15
     )
+    # Percentage of dev fee that goes to Tunga
     tunga_percentage_dev = models.DecimalField(
         max_digits=7, decimal_places=4, default=34.21
     )
+    # Percentage of pm fee that goes to Tunga
     tunga_percentage_pm = models.DecimalField(
         max_digits=7, decimal_places=4, default=48.71
+    )
+    unpaid_balance = models.DecimalField(
+        max_digits=19, decimal_places=4, default=0
     )
 
     # Contact info
@@ -190,19 +309,34 @@ class Task(models.Model):
     )
     btc_address = models.CharField(max_length=40, blank=True, null=True, validators=[validate_btc_address])
     btc_price = models.DecimalField(max_digits=18, decimal_places=8, blank=True, null=True)
+    multi_pay_key = models.ForeignKey(
+        MultiTaskPaymentKey, related_name='tasks', on_delete=models.DO_NOTHING, blank=True, null=True
+    )
+    multi_pay_distribute_key = models.ForeignKey(
+        MultiTaskPaymentKey, related_name='distribute_tasks', on_delete=models.DO_NOTHING, blank=True, null=True
+    )
+    includes_pm_fee = models.BooleanField(default=False)
 
     # Classification details
     type = models.IntegerField(choices=TASK_TYPE_CHOICES, default=TASK_TYPE_OTHER)  # Web, Mobile ...
     scope = models.IntegerField(choices=TASK_SCOPE_CHOICES, default=TASK_SCOPE_TASK)  # task, project or ongoing project
     has_requirements = models.BooleanField(default=False)
     pm_required = models.BooleanField(default=False)
-    contact_required = models.BooleanField(default=False)
+    contact_required = models.BooleanField(
+        default=False, help_text='True if client chooses to be contacted for more info?'
+    )
+    call_required = models.NullBooleanField(
+        null=True, help_text='True if client chooses to be called'
+    )
     skills = tagulous.models.TagField(Skill, blank=True)
     coders_needed = models.IntegerField(choices=TASK_CODERS_NEEDED_CHOICES, blank=True, null=True)
 
     # Update settings
-    update_interval = models.PositiveIntegerField(blank=True, null=True)
-    update_interval_units = models.PositiveSmallIntegerField(choices=UPDATE_SCHEDULE_CHOICES, blank=True, null=True)
+    update_interval = models.PositiveIntegerField(default=1)
+    update_interval_units = models.PositiveSmallIntegerField(
+        choices=UPDATE_SCHEDULE_CHOICES, default=UPDATE_SCHEDULE_DAILY
+    )
+    survey_client = models.BooleanField(default=True)
 
     # Audience for the task
     visibility = models.PositiveSmallIntegerField(choices=VISIBILITY_CHOICES, default=VISIBILITY_CHOICES[0][0])
@@ -213,33 +347,68 @@ class Task(models.Model):
     url = models.URLField(blank=True, null=True)
     remarks = models.TextField(blank=True, null=True)
     satisfaction = models.SmallIntegerField(blank=True, null=True, help_text="Client's rating of task developers")
-
+    trello_board_url = models.URLField(blank=True, null=True)
+    google_drive_url = models.URLField(blank=True, null=True)
+    hubspot_deal_id = models.CharField(editable=False, null=True, max_length=12)
+    
     # Task state modifiers
-    approved = models.BooleanField(default=False)
+    approved = models.BooleanField(
+        default=False, help_text='True if task or project is ready for developers'
+    )
+    review = models.BooleanField(
+        default=False, help_text='True if task or project should be reviewed by an admin'
+    )
     apply = models.BooleanField(
         default=True, help_text='True if developers can apply for this task (visibility can override this)'
     )
     closed = models.BooleanField(default=False, help_text='True if the task is closed')
+    payment_approved = models.BooleanField(default=False)
+    payment_link_sent = models.BooleanField(default=False)
+    processing = models.BooleanField(default=False, help_text='True if the task is processing')
     paid = models.BooleanField(default=False, help_text='True if the task is paid')
+    btc_paid = models.BooleanField(default=False, help_text='True if BTC has been paid in for a Stripe task')
     pay_distributed = models.BooleanField(
         default=False,
-        help_text='True if task has been paid and entire payment has been distributed tp participating developers'
+        help_text='True if task has been paid and entire payment has been distributed to participating developers'
     )
     archived = models.BooleanField(default=False)
     reminded_complete_task = models.BooleanField(default=False)
+    withhold_tunga_fee = models.BooleanField(
+        default=False,
+        help_text='Only participant portion will be paid if True, '
+                  'and all money paid will be distributed to participants'
+    )
+    withhold_tunga_fee_distribute = models.BooleanField(
+        default=False,
+        help_text='Only participant portion will be distributed if True, '
+                  'and all money paid will be distributed to participants'
+    )
+    last_drip_mail = models.CharField(max_length=50, blank=True, null=True)
 
     # Significant event dates
     deadline = models.DateTimeField(blank=True, null=True)
+    approved_at = models.DateTimeField(blank=True, null=True)
     apply_closed_at = models.DateTimeField(blank=True, null=True)
     closed_at = models.DateTimeField(blank=True, null=True)
+    payment_approved_at = models.DateTimeField(blank=True, null=True)
+    payment_link_sent_at = models.DateTimeField(blank=True, null=True)
+    processing_at = models.DateTimeField(blank=True, null=True)
     paid_at = models.DateTimeField(blank=True, null=True)
+    btc_paid_at = models.DateTimeField(blank=True, null=True)
     archived_at = models.DateTimeField(blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
     invoice_date = models.DateTimeField(blank=True, null=True)
     complete_task_email_at = models.DateTimeField(blank=True, null=True)
     check_task_email_at = models.DateTimeField(blank=True, null=True)
+    schedule_call_start = models.DateTimeField(blank=True, null=True)
+    schedule_call_end = models.DateTimeField(blank=True, null=True)
+    last_drip_mail_at = models.DateTimeField(blank=True, null=True)
+    pause_updates_until = models.DateTimeField(blank=True, null=True)
 
     # Applications and participation info
+    owner = models.ForeignKey(
+        settings.AUTH_USER_MODEL, related_name='tasks_owned', on_delete=models.DO_NOTHING, blank=True, null=True
+    )
     pm = models.ForeignKey(
         settings.AUTH_USER_MODEL, related_name='tasks_managed', on_delete=models.DO_NOTHING, blank=True, null=True
     )
@@ -250,6 +419,16 @@ class Task(models.Model):
     participants = models.ManyToManyField(
             settings.AUTH_USER_MODEL, through='Participation', through_fields=('task', 'user'),
             related_name='task_participants', blank=True)
+    payment_approved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, related_name='tasks_payments_approved',
+        on_delete=models.DO_NOTHING, blank=True, null=True
+    )
+
+    # Allow non-authenticated wizard user to edit after creation
+    edit_token = models.UUIDField(default=uuid.uuid4, editable=False)
+
+    # Tracking info
+    analytics_id = models.CharField(max_length=40, blank=True, null=True)
 
     # Relationships
     comments = GenericRelation(Comment, related_query_name='tasks')
@@ -263,7 +442,7 @@ class Task(models.Model):
     )
     read_logs = GenericRelation(ActivityReadLog, related_query_name='tasks')
 
-    def __unicode__(self):
+    def __str__(self):
         return self.summary
 
     class Meta:
@@ -275,6 +454,8 @@ class Task(models.Model):
                 if self.source == TASK_SOURCE_NEW_USER and self.scope == TASK_SCOPE_TASK and self.description and len(
                         self.description.split(' ')) >= 15:
                     self.approved = True
+            if self.scope != TASK_SCOPE_TASK and self.pm_required and not self.payment_approved and not self.includes_pm_fee:
+                self.includes_pm_fee = True
         else:
             # Analyze new tasks to decide on approval status
             if self.source == TASK_SOURCE_NEW_USER:
@@ -288,14 +469,20 @@ class Task(models.Model):
                 self.approved = bool(
                     self.scope == TASK_SCOPE_TASK or (self.scope == TASK_SCOPE_PROJECT and not self.pm_required)
                 )
-
+            self.includes_pm_fee = bool(self.scope != TASK_SCOPE_TASK and self.pm_required)
         super(Task, self).save(
             force_insert=force_insert, force_update=force_update, using=using, update_fields=update_fields
         )
 
     def has_admin_access(self, user):
         if user and user.is_authenticated():
+            if user.is_admin:
+                return True
             if user == self.user:
+                return True
+            if user == self.owner:
+                return True
+            if user == self.pm:
                 return True
             return self.taskaccess_set.filter(user=user).count() == 1
         return False
@@ -306,6 +493,11 @@ class Task(models.Model):
             (Q(task=self) | Q(task__parent=self))
         )
 
+    def get_is_participant(self, user, active_only=True):
+        return self.subtask_participants_inclusive_filter.filter(
+            user=user, status__in=active_only and [STATUS_ACCEPTED] or [STATUS_INITIAL, STATUS_ACCEPTED]
+        ).count() > 0
+
     @staticmethod
     @allow_staff_or_superuser
     def has_read_permission(request):
@@ -313,30 +505,29 @@ class Task(models.Model):
 
     @allow_staff_or_superuser
     def has_object_read_permission(self, request):
-        if request.user == self.user or \
+        if str(self.edit_token) == get_edit_token_header(request) or request.user == self.user or \
                 (self.parent and request.user == self.parent.user) or \
                 self.has_admin_access(request.user) or \
-                (request.user.is_project_manager): #and (self.pm == request.user or not self.pm)):
+                (request.user.is_authenticated() and request.user.is_project_manager): #and (self.pm == request.user or not self.pm)):
             return True
         elif self.visibility == VISIBILITY_DEVELOPER:
-            return request.user.type == USER_TYPE_DEVELOPER
+            return request.user.is_authenticated() and request.user.is_developer
         elif self.visibility == VISIBILITY_MY_TEAM:
             return bool(
-                Connection.objects.exclude(accepted=False).filter(
+                Connection.objects.exclude(status=STATUS_REJECTED).filter(
                     Q(from_user=self.user, to_user=request.user) | Q(from_user=request.user, to_user=self.user)
                 ).count()
             )
         elif self.visibility == VISIBILITY_CUSTOM:
             return self.subtask_participants_inclusive_filter.filter(
-                (Q(accepted=True) | Q(responded=False)),
-                user=request.user
+                user=request.user, status__in=[STATUS_INITIAL, STATUS_ACCEPTED]
             ).count()
         return False
 
     @staticmethod
     @allow_staff_or_superuser
     def has_write_permission(request):
-        return request.user.is_project_owner or request.user.is_project_manager
+        return not request.user.is_authenticated() or (request.user.is_project_owner or request.user.is_project_manager)
 
     @staticmethod
     @allow_staff_or_superuser
@@ -350,7 +541,7 @@ class Task(models.Model):
 
     @allow_staff_or_superuser
     def has_object_write_permission(self, request):
-        return request.user == self.user or \
+        return str(self.edit_token) == get_edit_token_header(request) or request.user == self.user or \
                (self.parent and request.user == self.parent.user) or \
                self.has_admin_access(request.user)
 
@@ -362,11 +553,17 @@ class Task(models.Model):
         if request.method in ['PUT', 'PATCH']:
             allowed_keys = [
                 'assignee', 'participation', 'participants',
-                'confirmed_participants', 'rejected_participants'
+                'confirmed_participants', 'rejected_participants', 'pause_updates_until'
             ]
             if not [x for x in request.data.keys() if not (x in allowed_keys or re.match(r'^file\d*$', x))]:
-                return (self.pm and self.pm.id == request.user.id) or self.participation_set.filter((Q(accepted=True) | Q(responded=False)), user=request.user).count()
+                return (self.pm and self.pm.id == request.user.id) or self.participation_set.filter(
+                    user=request.user, status__in=[STATUS_INITIAL, STATUS_ACCEPTED]
+                ).count()
         return False
+
+    @property
+    def from_new_user(self):
+        return self.source == TASK_SOURCE_NEW_USER
 
     @property
     def task_number(self):
@@ -374,15 +571,15 @@ class Task(models.Model):
 
     @property
     def tunga_ratio_dev(self):
-        return self.tunga_percentage_dev * Decimal(0.01)
+        return Decimal(self.tunga_percentage_dev) * Decimal(0.01)
 
     @property
     def tunga_ratio_pm(self):
-        return self.tunga_percentage_pm * Decimal(0.01)
+        return Decimal(self.tunga_percentage_pm) * Decimal(0.01)
 
     @property
     def pm_time_ratio(self):
-        return self.pm_time_percentage * Decimal(0.01)
+        return Decimal(self.pm_time_percentage) * Decimal(0.01)
 
     @property
     def pay(self):
@@ -398,6 +595,14 @@ class Task(models.Model):
             return self.pm_time_ratio*self.pay
         return 0
 
+    @property
+    def tunga_ratio_pm(self):
+        return Decimal(self.tunga_percentage_pm) * Decimal(0.01)
+
+    @property
+    def tax_ratio(self):
+        return Decimal(self.tax_rate) * Decimal(0.01)
+
     def display_fee(self, amount=None):
         if amount is None:
             amount = self.pay
@@ -405,7 +610,7 @@ class Task(models.Model):
             return ''
         if self.currency in CURRENCY_SYMBOLS:
             return '{}{}'.format(CURRENCY_SYMBOLS[self.currency], floatformat(amount, arg=-2))
-        return amount
+        return amount or ''
     display_fee.short_description = 'Fee'
 
     @property
@@ -426,7 +631,7 @@ class Task(models.Model):
             return True
         if self.scope == TASK_SCOPE_PROJECT and not self.pm_required and self.source != TASK_SOURCE_NEW_USER:
             return True
-        if self.quote and self.quote.status == STATUS_ACCEPTED:
+        if self.estimate and self.estimate.status == STATUS_ACCEPTED:
             return True
         return False
 
@@ -448,21 +653,38 @@ class Task(models.Model):
                 dict(
                     currency=CURRENCY_SYMBOLS.get(self.currency, ''),
                     pledge=self.pay,
-                    developer=(1 - self.tunga_ratio_dev) * self.pay_dev,
-                    pm=(1 - self.tunga_ratio_pm) * self.pay_pm,
-                    processing=processing_share * self.pay
+                    developer=Decimal(1 - self.tunga_ratio_dev) * self.pay_dev,
+                    pm=Decimal(1 - self.tunga_ratio_pm) * self.pay_pm,
+                    processing=self.payment_method == TASK_PAYMENT_METHOD_STRIPE and stripe_utils.calculate_payment_fee(self.pay) or (processing_share * self.pay)
                 )
             )
             amount_details['tunga'] = self.pay - (amount_details['developer'] + amount_details['pm'])
             amount_details['total'] = self.pay + amount_details['processing']
+
+            task_owner = self.user
+            if self.owner:
+                task_owner = self.owner
+            vat = task_owner.tax_rate
+            vat_amount = Decimal(vat) * Decimal(0.01) * amount_details['total']
+            amount_details['vat'] = vat
+            amount_details['vat_amount'] = round_decimal(vat_amount, 2)
+            amount_details['plus_tax'] = round_decimal(amount_details['total'] + vat_amount, 2)
         return amount_details
 
     @property
     def summary(self):
+        task_summary = ''
         try:
-            return self.title or truncatewords(strip_tags(self.description).strip(), 10)
+            task_summary = self.title or truncatewords(strip_tags(self.description or '').strip(), 10)
         except:
-            return '{} #{}'.format(self.is_task and 'Task' or 'Project', self.id)
+            pass
+        if not task_summary:
+            task_summary = '{} #{}'.format(self.is_task and 'Task' or 'Project', self.id)
+        return task_summary
+
+    @property
+    def detailed_summary(self):
+        return '{} - {}'.format((self.owner or self.user).display_name, self.summary)
 
     @property
     def excerpt(self):
@@ -475,8 +697,18 @@ class Task(models.Model):
     def skills_list(self):
         return str(self.skills)
 
+    @property
     def payment_status(self):
-        return self.paid and self.pay_distributed and 'Paid' or self.paid and 'Processing' or 'Pending'
+        if self.paid and self.pay_distributed:
+            return 'Paid'
+        if self.paid or self.processing:
+            return 'Processing'
+        return 'Pending'
+
+    @property
+    def can_pay_distribution_btc(self):
+        return self.payment_method == TASK_PAYMENT_METHOD_STRIPE and self.paid and \
+               not self.btc_paid and not self.pay_distributed
 
     @property
     def milestones(self):
@@ -488,16 +720,43 @@ class Task(models.Model):
 
     @property
     def participation(self):
-        return self.participation_set.filter(Q(accepted=True) | Q(responded=False))
+        return self.subtask_participants_inclusive_filter.filter(status__in=[STATUS_INITIAL, STATUS_ACCEPTED])
+
+    @property
+    def active_participation(self):
+        return self.subtask_participants_inclusive_filter.filter(status=STATUS_ACCEPTED)
 
     @property
     def active_participants(self):
-        return self.participation_set.filter(accepted=True)
+        return list(set([item.user for item in self.active_participation]))
+
+    @property
+    def updates_participation(self):
+        return self.subtask_participants_inclusive_filter.filter(status=STATUS_ACCEPTED, updates_enabled=True)
+
+    @property
+    def updates_participants(self):
+        return list(set([item.user for item in self.updates_participation]))
+
+    @property
+    def admins(self):
+        return list(set([item.user for item in self.taskaccess_set.all()]))
+
+    @property
+    def started_at(self):
+        return self.subtask_participants_inclusive_filter.filter(status=STATUS_ACCEPTED).aggregate(
+            start_date=Min('activated_at'))['start_date']
+
+    @property
+    def started(self):
+        return bool(self.started_at)
 
     @property
     def assignee(self):
         try:
-            return self.participation_set.get((Q(accepted=True) | Q(responded=False)), assignee=True)
+            return self.participation_set.get(
+                assignee=True, status__in=[STATUS_INITIAL, STATUS_ACCEPTED]
+            )
         except:
             return None
 
@@ -523,6 +782,13 @@ class Task(models.Model):
             return None
 
     @property
+    def sprints(self):
+        try:
+            return self.sprint_set.all().order_by('start_date', 'end_date', 'id', 'created_at')
+        except:
+            return None
+
+    @property
     def update_schedule_display(self):
         if self.update_interval and self.update_interval_units:
             if self.update_interval == 1 and self.update_interval_units == UPDATE_SCHEDULE_DAILY:
@@ -535,7 +801,7 @@ class Task(models.Model):
 
     @property
     def applications(self):
-        return self.application_set.filter(responded=False)
+        return self.application_set.filter(status=STATUS_INITIAL)
 
     @property
     def all_uploads(self):
@@ -551,8 +817,14 @@ class Task(models.Model):
             Q(progress_events__task=self) | Q(progress_events__task__parent=self)
         )
 
+    @property
+    def payment_withheld_tunga_fee(self):
+        if self.payment_method == TASK_PAYMENT_METHOD_STRIPE:
+            return self.withhold_tunga_fee_distribute
+        return self.withhold_tunga_fee
+
     def get_participation_shares(self, return_hash=False):
-        participants = self.participation_set.filter(accepted=True).order_by('-share')
+        participants = self.participation_set.filter(status=STATUS_ACCEPTED).order_by('-share')
         num_participants = participants.count()
 
         participation_shares = []
@@ -569,7 +841,8 @@ class Task(models.Model):
                     share = Decimal(participant.share or 0)/Decimal(total_shares)
                 share_info = {
                     'participant': participant,
-                    'share': share
+                    'share': share,
+                    'value': participant.share or 0
                 }
                 participation_shares.append(share_info)
                 participation_shares_hash[participant.id] = share_info
@@ -583,7 +856,7 @@ class Task(models.Model):
             for data in participation_shares:
                 payment_shares.append({
                     'participant': data['participant'],
-                    'share': Decimal(data['share'])*Decimal(1 - self.tunga_ratio_dev)
+                    'share': Decimal(data['share'])*Decimal(self.payment_withheld_tunga_fee and 1 or (1 - self.tunga_ratio_dev))*Decimal(self.payment_withheld_tunga_fee and 1 or (1 - self.tax_ratio))
                 })
         return payment_shares
 
@@ -598,28 +871,42 @@ class Task(models.Model):
     def get_user_payment_share(self, participation_id):
         share = self.get_user_participation_share(participation_id=participation_id)
         if share:
-            return share*(Decimal(100 - self.tunga_percentage_dev) / Decimal(100))
+            return share*Decimal(self.payment_withheld_tunga_fee and 1 or (1 - self.tunga_ratio_dev))*Decimal(self.payment_withheld_tunga_fee and 1 or (1 - self.tax_ratio))
         return 0
 
 
+@python_2_unicode_compatible
 class TaskAccess(models.Model):
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
     task = models.ForeignKey(Task, on_delete=models.CASCADE)
     created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='admins_added')
     created_at = models.DateTimeField(auto_now_add=True)
 
-    def __unicode__(self):
+    def __str__(self):
         return '%s - %s' % (self.user.get_short_name() or self.user.username, self.task.summary)
 
     class Meta:
         unique_together = ('user', 'task')
 
 
+REQUEST_STATUS_CHOICES = (
+    (STATUS_INITIAL, 'Initial'),
+    (STATUS_ACCEPTED, 'Accepted'),
+    (STATUS_REJECTED, 'Rejected')
+)
+
+
+@python_2_unicode_compatible
 class Application(models.Model):
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
     task = models.ForeignKey(Task, on_delete=models.CASCADE)
     accepted = models.BooleanField(default=False)
     responded = models.BooleanField(default=False)
+    status = models.CharField(
+        max_length=20, choices=REQUEST_STATUS_CHOICES,
+        help_text=','.join(['%s - %s' % (item[0], item[1]) for item in REQUEST_STATUS_CHOICES]),
+        default=STATUS_INITIAL
+    )
     pitch = models.CharField(max_length=1000, blank=True, null=True)
     hours_needed = models.PositiveIntegerField(blank=True, null=True)
     hours_available = models.PositiveIntegerField(blank=True, null=True)
@@ -629,7 +916,7 @@ class Application(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     channels = GenericRelation(Channel, related_query_name='task_applications')
 
-    def __unicode__(self):
+    def __str__(self):
         return '%s - %s' % (self.user.get_short_name() or self.user.username, self.task.summary)
 
     class Meta:
@@ -664,25 +951,33 @@ class Application(models.Model):
         return request.user == self.user or request.user == self.task.user
 
 
+@python_2_unicode_compatible
 class Participation(models.Model):
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.DO_NOTHING)
     task = models.ForeignKey(Task, on_delete=models.CASCADE)
     accepted = models.BooleanField(default=False)
     responded = models.BooleanField(default=False)
+    status = models.CharField(
+        max_length=20, choices=REQUEST_STATUS_CHOICES,
+        help_text=','.join(['%s - %s' % (item[0], item[1]) for item in REQUEST_STATUS_CHOICES]),
+        default=STATUS_INITIAL
+    )
     assignee = models.BooleanField(default=False)
     role = models.CharField(max_length=100, default='Developer')
     share = models.DecimalField(max_digits=5, decimal_places=2, blank=True, null=True)
+    updates_enabled = models.BooleanField(default=True)
+    paid = models.BooleanField(default=False)
     satisfaction = models.SmallIntegerField(blank=True, null=True)
     created_by = models.ForeignKey(settings.AUTH_USER_MODEL, related_name='participants_added')
     created_at = models.DateTimeField(auto_now_add=True)
     activated_at = models.DateTimeField(blank=True, null=True)
-    paid = models.BooleanField(default=False)
+    pause_updates_until = models.DateTimeField(blank=True, null=True)
     paid_at = models.DateTimeField(blank=True, null=True)
 
     ratings = GenericRelation(Rating, related_query_name='participants')
 
-    def __unicode__(self):
-        return '%s - %s' % (self.user.get_short_name() or self.user.username, self.task.title)
+    def __str__(self):
+        return '#{} | {} - {}'.format(self.id, self.user.get_short_name() or self.user.username, self.task.title)
 
     class Meta:
         unique_together = ('user', 'task')
@@ -701,8 +996,9 @@ class Participation(models.Model):
         return self.task.get_user_payment_share(participation_id=self.id) or 0
 
 
+@python_2_unicode_compatible
 class WorkActivity(models.Model):
-    # The target of the activity (estimate or quote)
+    # The target of the activity (estimate, quote or sprint)
     content_type = models.ForeignKey(ContentType, on_delete=models.CASCADE, verbose_name=_('content type'))
     object_id = models.PositiveIntegerField()
     content_object = GenericForeignKey('content_type', 'object_id')
@@ -711,16 +1007,26 @@ class WorkActivity(models.Model):
     title = models.CharField(max_length=200)
     description = models.TextField(blank=True, null=True)
     hours = models.FloatField()
+    completed = models.NullBooleanField(default=None)
     due_at = models.DateTimeField(blank=True, null=True)
+    assignee = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.DO_NOTHING, blank=True, null=True, related_name='assigned_work_activities')
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
-    def __unicode__(self):
+    def __str__(self):
         return 'Activity | {}'.format(self.content_object)
 
+    class Meta:
+        verbose_name_plural = 'work activities'
 
+    @property
+    def dev_fee(self):
+        return Decimal(self.hours) * self.content_object.task.dev_rate
+
+
+@python_2_unicode_compatible
 class WorkPlan(models.Model):
-    # The target of the activity (estimate or quote)
+    # The target of the activity (estimate, quote or sprint)
     content_type = models.ForeignKey(ContentType, on_delete=models.CASCADE, verbose_name=_('content type'))
     object_id = models.PositiveIntegerField()
     content_object = GenericForeignKey('content_type', 'object_id')
@@ -733,7 +1039,7 @@ class WorkPlan(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
-    def __unicode__(self):
+    def __str__(self):
         return 'WorkPlan | {}'.format(self.content_object)
 
 
@@ -749,13 +1055,16 @@ ESTIMATE_STATUS_CHOICES = (
 )
 
 
+@python_2_unicode_compatible
 class AbstractEstimate(models.Model):
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.DO_NOTHING)
-    task = models.ForeignKey(Task, on_delete=models.CASCADE)
+    task = models.ForeignKey(Task, on_delete=models.CASCADE, blank=True, null=True)
+    title = models.CharField(max_length=200, blank=True, null=True)
     introduction = models.TextField()
+
     # Status
     status = models.CharField(
-        max_length=30, choices=ESTIMATE_STATUS_CHOICES, default=STATUS_INITIAL,
+        max_length=20, choices=ESTIMATE_STATUS_CHOICES, default=STATUS_INITIAL,
         help_text=', '.join(['%s - %s' % (item[0], item[1]) for item in ESTIMATE_STATUS_CHOICES])
     )
     start_date = models.DateTimeField(blank=True, null=True)
@@ -791,7 +1100,7 @@ class AbstractEstimate(models.Model):
     )
     activities = GenericRelation(WorkActivity, related_query_name='%(class)s')
 
-    def __unicode__(self):
+    def __str__(self):
         return '{} | {}'.format('%(class)'.title(), self.task.summary)
 
     class Meta:
@@ -821,11 +1130,11 @@ class AbstractEstimate(models.Model):
 
     @property
     def pm_hours(self):
-        return self.dev_hours*self.task.pm_time_ratio
+        return Decimal(self.dev_hours)*self.task.pm_time_ratio
 
     @property
     def hours(self):
-        return self.dev_hours + self.pm_hours
+        return Decimal(self.dev_hours) + self.pm_hours
 
     @property
     def dev_fee(self):
@@ -857,12 +1166,14 @@ class AbstractEstimate(models.Model):
         )
 
 
+# @python_2_unicode_compatible
 class Estimate(AbstractEstimate):
     pass
 
 QUOTE_STATUS_CHOICES = ESTIMATE_STATUS_CHOICES
 
 
+# @python_2_unicode_compatible
 class Quote(AbstractEstimate):
     # Scope
     in_scope = models.TextField()
@@ -880,6 +1191,11 @@ class Quote(AbstractEstimate):
     plan = GenericRelation(WorkPlan, related_query_name='quotes')
 
 
+class Sprint(AbstractEstimate):
+    pass
+
+
+@python_2_unicode_compatible
 class TimeEntry(models.Model):
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
     task = models.ForeignKey(Task, on_delete=models.CASCADE)
@@ -889,11 +1205,12 @@ class TimeEntry(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
-    def __unicode__(self):
+    def __str__(self):
         return '{} hrs | {} - {}'.format(self.hours, self.task.summary, self.user.get_short_name() or self.user.username)
 
     class Meta:
         ordering = ['spent_at']
+        verbose_name_plural = 'time entries'
 
     @staticmethod
     @allow_staff_or_superuser
@@ -919,10 +1236,13 @@ PROGRESS_EVENT_TYPE_CHOICES = (
     (PROGRESS_EVENT_TYPE_PERIODIC, 'Periodic Update'),
     (PROGRESS_EVENT_TYPE_MILESTONE, 'Milestone'),
     (PROGRESS_EVENT_TYPE_SUBMIT, 'Final Draft'),
-    (PROGRESS_EVENT_TYPE_COMPLETE, 'Submission')
+    (PROGRESS_EVENT_TYPE_COMPLETE, 'Submission'),
+    (PROGRESS_EVENT_TYPE_PM, 'PM Update'),
+    (PROGRESS_EVENT_TYPE_CLIENT, 'Client Survey')
 )
 
 
+@python_2_unicode_compatible
 class ProgressEvent(models.Model):
     task = models.ForeignKey(Task, on_delete=models.CASCADE)
     type = models.PositiveSmallIntegerField(
@@ -935,6 +1255,7 @@ class ProgressEvent(models.Model):
     created_by = models.ForeignKey(settings.AUTH_USER_MODEL, related_name='progress_events_created', blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
     last_reminder_at = models.DateTimeField(blank=True, null=True)
+    missed_notification_at = models.DateTimeField(blank=True, null=True)
 
     activity_objects = GenericRelation(
         Action,
@@ -943,11 +1264,11 @@ class ProgressEvent(models.Model):
         related_query_name='progress_events'
     )
 
-    def __unicode__(self):
+    def __str__(self):
         return '%s | %s - %s' % (self.get_type_display(), self.task.summary, self.due_at)
 
     class Meta:
-        unique_together = ('task', 'due_at')
+        # unique_together = ('task', 'due_at')
         ordering = ['-due_at']
 
     @staticmethod
@@ -962,36 +1283,135 @@ class ProgressEvent(models.Model):
     @staticmethod
     @allow_staff_or_superuser
     def has_write_permission(request):
-        return request.user.is_project_owner or request.user.is_project_manager
+        return request.user.is_project_owner or request.user.is_project_manager or request.user.is_project_owner
 
     @allow_staff_or_superuser
     def has_object_write_permission(self, request):
         return request.user == self.task.user
 
+    def user_report(self, user):
+        try:
+            reports = self.progressreport_set.filter(user=user)
+            if reports:
+                return reports[0]
+        except:
+            pass
+        return
+
+    def get_is_participant(self, user, active_only=True):
+        if self.type == PROGRESS_EVENT_TYPE_PM:
+            if not self.task.is_project or not user.is_project_manager:
+                return False
+            if self.task.pm:
+                return self.task.pm == user
+            else:
+                return self.task.user == user
+        elif self.type == PROGRESS_EVENT_TYPE_CLIENT:
+            return self.task.has_admin_access(user)
+        return self.task.get_is_participant(user, active_only=active_only)
+
+    @property
+    def participants(self):
+        participants = []
+        if self.type == PROGRESS_EVENT_TYPE_PM:
+            if self.task.is_project and self.task.pm:
+                participants.append(self.task.pm)
+        elif self.type == PROGRESS_EVENT_TYPE_CLIENT:
+            if self.task.owner:
+                participants.append(self.task.owner)
+            else:
+                participants.append(self.task.user)
+        else:
+            participants.extend(self.task.active_participants)
+        return participants
+
+    @property
+    def pm(self):
+        return self.task.pm
+
+    @property
+    def status(self):
+        if self.progressreport_set.count() > 0:
+            return 'completed'
+        past_by_24_hours = datetime.datetime.utcnow() - relativedelta(hours=24)
+        if self.due_at > past_by_24_hours:
+            return 'upcoming'
+        return 'missed'
+
 
 PROGRESS_REPORT_STATUS_CHOICES = (
     (PROGRESS_REPORT_STATUS_ON_SCHEDULE, 'On schedule'),
     (PROGRESS_REPORT_STATUS_BEHIND, 'Behind'),
-    (PROGRESS_REPORT_STATUS_STUCK, 'Stuck')
+    (PROGRESS_REPORT_STATUS_STUCK, 'Stuck'),
+    (PROGRESS_REPORT_STATUS_BEHIND_BUT_PROGRESSING, 'Behind but Progressing'),
+    (PROGRESS_REPORT_STATUS_BEHIND_AND_STUCK, 'Behind and Stuck')
+)
+
+PROGRESS_REPORT_STUCK_REASON_CHOICES = (
+    (PROGRESS_REPORT_STUCK_REASON_ERROR, 'Resolving an Error'),
+    (PROGRESS_REPORT_STUCK_REASON_POOR_DOC, 'Poor Documenatation'),
+    (PROGRESS_REPORT_STUCK_REASON_HARDWARE, 'Hardware problem'),
+    (PROGRESS_REPORT_STUCK_REASON_UNCLEAR_SPEC, 'Unclear specifications'),
+    (PROGRESS_REPORT_STUCK_REASON_PERSONAL, 'Personal Circumstances'),
+    (PROGRESS_REPORT_STUCK_REASON_OTHER, 'Other'),
 )
 
 
+@python_2_unicode_compatible
 class ProgressReport(models.Model):
-    event = models.OneToOneField(ProgressEvent, on_delete=models.CASCADE)
+    event = models.ForeignKey(ProgressEvent, on_delete=models.CASCADE)
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.DO_NOTHING)
+
+    # Status details
     status = models.PositiveSmallIntegerField(
         choices=PROGRESS_REPORT_STATUS_CHOICES,
-        help_text=','.join(['%s - %s' % (item[0], item[1]) for item in PROGRESS_REPORT_STATUS_CHOICES])
+        help_text=','.join(
+            ['%s - %s' % (item[0], item[1]) for item in PROGRESS_REPORT_STATUS_CHOICES]),
+        blank=True, null=True
     )
-    percentage = models.PositiveIntegerField(validators=[MinValueValidator(0), MaxValueValidator(100)])
-    accomplished = models.TextField()
-    next_steps = models.TextField(blank=True, null=True)
+    percentage = models.PositiveIntegerField(
+        validators=[MinValueValidator(0), MaxValueValidator(100)], blank=True, null=True
+    )
+    accomplished = models.TextField(blank=True, null=True)
+    todo = models.TextField(blank=True, null=True)
     obstacles = models.TextField(blank=True, null=True)
     remarks = models.TextField(blank=True, null=True)
+    stuck_reason = models.PositiveIntegerField(
+        choices=PROGRESS_REPORT_STUCK_REASON_CHOICES,
+        help_text=','.join(
+            ['%s - %s' % (item[0], item[1]) for item in PROGRESS_REPORT_STUCK_REASON_CHOICES]),
+        blank=True, null=True
+    )
+    stuck_details = models.TextField(blank=True, null=True)
+
+    # Deliverables
+    rate_deliverables = models.PositiveIntegerField(
+        validators=[MinValueValidator(0), MaxValueValidator(10)], blank=True, null=True
+    )
+
+    # Deadline Info
+    started_at = models.DateTimeField(blank=True, null=True)
+    last_deadline_met = models.NullBooleanField(blank=True, null=True)
+    deadline_miss_communicated = models.NullBooleanField(blank=True, null=True)
+    deadline_report = models.TextField(blank=True, null=True)
+    next_deadline = models.DateTimeField(blank=True, null=True)
+    next_deadline_meet = models.NullBooleanField(blank=True, null=True)
+    next_deadline_fail_reason = models.TextField(blank=True, null=True)
+
+    # PMs only
+    team_appraisal = models.TextField(blank=True, null=True)
+
+    # Clients only
+    deliverable_satisfaction = models.NullBooleanField(blank=True, null=True)
+    rate_communication = models.PositiveIntegerField(
+        validators=[MinValueValidator(0), MaxValueValidator(10)], blank=True, null=True
+    )
+    pm_communication = models.NullBooleanField(blank=True, null=True)
+
     created_at = models.DateTimeField(auto_now_add=True)
     uploads = GenericRelation(Upload, related_query_name='progress_reports')
 
-    def __unicode__(self):
+    def __str__(self):
         return '{0} - {1}%'.format(self.event, self.percentage)
 
     @staticmethod
@@ -1006,13 +1426,49 @@ class ProgressReport(models.Model):
     @staticmethod
     @allow_staff_or_superuser
     def has_write_permission(request):
-        return request.user.type == USER_TYPE_DEVELOPER
+        return request.user.is_developer or request.user.is_project_manager or request.user.is_project_owner
 
     @allow_staff_or_superuser
     def has_object_write_permission(self, request):
         return request.user == self.user
 
 
+@python_2_unicode_compatible
+class SummaryReport(models.Model):
+    task = models.ForeignKey(Task, on_delete=models.CASCADE)
+    developer = models.ForeignKey(ProgressReport, related_name='dev_summary_reports', on_delete=models.CASCADE, blank=True, null=True)
+    pm = models.ForeignKey(ProgressReport, related_name='pm_summary_reports', on_delete=models.CASCADE, blank=True, null=True)
+    owner = models.ForeignKey(ProgressReport, related_name='owner_summary_reports', on_delete=models.CASCADE, blank=True, null=True)
+
+    report_for = models.DateTimeField(auto_now_add=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    email_at = models.DateTimeField(auto_now_add=True)
+    slack_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return '{0} - {1}%'.format(self.task.summary, self.report_for)
+
+    @staticmethod
+    @allow_staff_or_superuser
+    def has_read_permission(request):
+        return False
+
+    @allow_staff_or_superuser
+    def has_object_read_permission(self, request):
+        return False
+
+    @staticmethod
+    @allow_staff_or_superuser
+    def has_write_permission(request):
+        return False
+
+    @allow_staff_or_superuser
+    def has_object_write_permission(self, request):
+        return False
+
+
+@python_2_unicode_compatible
 class IntegrationEvent(models.Model):
     id = models.CharField(max_length=30, primary_key=True)
     name = models.CharField(max_length=30)
@@ -1024,7 +1480,7 @@ class IntegrationEvent(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
-    def __unicode__(self):
+    def __str__(self):
         return '%s - %s' % (self.id, self.name)
 
     class Meta:
@@ -1044,6 +1500,7 @@ INTEGRATION_TYPE_CHOICES = (
 )
 
 
+@python_2_unicode_compatible
 class Integration(models.Model):
     task = models.ForeignKey(Task, on_delete=models.CASCADE)
     provider = models.CharField(
@@ -1061,7 +1518,7 @@ class Integration(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
-    def __unicode__(self):
+    def __str__(self):
         return '%s - %s' % (self.get_provider_display(), self.task.summary)
 
     class Meta:
@@ -1159,6 +1616,7 @@ class Integration(models.Model):
             return None
 
 
+@python_2_unicode_compatible
 class IntegrationMeta(models.Model):
     integration = models.ForeignKey(Integration, on_delete=models.CASCADE)
     meta_key = models.CharField(max_length=30)
@@ -1170,13 +1628,14 @@ class IntegrationMeta(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
-    def __unicode__(self):
+    def __str__(self):
         return '%s | %s - %s' % (self.integration, self.meta_key, self.meta_value)
 
     class Meta:
         ordering = ['created_at']
 
 
+@python_2_unicode_compatible
 class IntegrationActivity(models.Model):
     integration = models.ForeignKey(Integration, on_delete=models.CASCADE, related_name='activities')
     event = models.ForeignKey(IntegrationEvent, related_name='integration_activities')
@@ -1192,30 +1651,67 @@ class IntegrationActivity(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
-    def __unicode__(self):
+    def __str__(self):
         return '%s | ' % (self.integration, )
 
     class Meta:
         ordering = ['created_at']
 
+TASK_PAYMENT_TYPE_CHOICES = (
+    (TASK_PAYMENT_METHOD_STRIPE, 'Stripe'),
+    (TASK_PAYMENT_METHOD_BITCOIN, 'BitCoin')
+)
 
+
+@python_2_unicode_compatible
 class TaskPayment(models.Model):
-    task = models.ForeignKey(Task)
-    btc_address = models.CharField(max_length=40, validators=[validate_btc_address])
+    task = models.ForeignKey(Task, blank=True, null=True)
+    multi_pay_key = models.ForeignKey(MultiTaskPaymentKey, blank=True, null=True)
     ref = models.CharField(max_length=255)
-    btc_price = models.DecimalField(max_digits=18, decimal_places=8)
+    payment_type = models.CharField(
+        max_length=30, choices=TASK_PAYMENT_TYPE_CHOICES,
+        help_text=','.join(['{} - {}'.format(item[0], item[1]) for item in TASK_PAYMENT_TYPE_CHOICES])
+    )
+
+    # BTC / Coinbase
+    btc_address = models.CharField(max_length=40, validators=[validate_btc_address], blank=True, null=True)
+    btc_price = models.DecimalField(max_digits=18, decimal_places=8, blank=True, null=True)
     btc_received = models.DecimalField(max_digits=18, decimal_places=8, default=0)
+
+    # Stripe
+    token = models.CharField(max_length=100, blank=True, null=True)
+    email = models.EmailField(blank=True, null=True)
+    amount = models.DecimalField(max_digits=19, decimal_places=4, blank=True, null=True)
+    currency = models.CharField(max_length=5, choices=CURRENCY_CHOICES, blank=True, null=True)
+    charge_id = models.CharField(max_length=100, blank=True, null=True)
+    paid = models.BooleanField(default=False)
+    captured = models.BooleanField(default=False)
+
+    # Distribution
     processed = models.BooleanField(default=False)
+
+    # Dates
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     received_at = models.DateTimeField(blank=True, null=True)
 
-    def __unicode__(self):
-        return 'bitcoin:%s - %s' % (self.btc_address, self.task.summary)
+    def __str__(self):
+        return '{}:{} - {} | {}'.format(
+            self.get_payment_type_display(),
+            self.payment_type == TASK_PAYMENT_METHOD_STRIPE and self.charge_id or self.btc_address,
+            self.payment_type == TASK_PAYMENT_METHOD_STRIPE and self.amount or self.btc_received,
+            self.task and self.task.summary or 'Multi Task Payment'
+        )
 
     class Meta:
-        unique_together = ('btc_address', 'ref')
-        ordering = ['created_at']
+        unique_together = ('task', 'ref')
+        ordering = ['-created_at']
+
+    def task_btc_share(self, task):
+        share_ratio = 1
+        if self.multi_pay_key:
+            share_ratio = self.multi_pay_key.get_task_share_ratio(task)
+        return share_ratio*self.btc_received
 
 
 PAYMENT_STATUS_CHOICES = (
@@ -1224,9 +1720,11 @@ PAYMENT_STATUS_CHOICES = (
     (STATUS_PROCESSING, 'Processing'),
     (STATUS_COMPLETED, 'Completed'),
     (STATUS_FAILED, 'Failed'),
+    (STATUS_CANCELED, 'Canceled'),
 )
 
 
+@python_2_unicode_compatible
 class ParticipantPayment(models.Model):
     participant = models.ForeignKey(Participation)
     source = models.ForeignKey(TaskPayment)
@@ -1245,20 +1743,24 @@ class ParticipantPayment(models.Model):
     description = models.CharField(max_length=200, blank=True, null=True)
     extra = models.TextField(blank=True, null=True)  # JSON formatted extra details
 
-    def __unicode__(self):
+    def __str__(self):
         return 'bitcoin:%s - %s | %s' % (self.destination, self.participant.user, self.description)
 
     class Meta:
         unique_together = ('participant', 'source')
-        ordering = ['created_at']
+        ordering = ['-created_at']
 
 
+@python_2_unicode_compatible
 class TaskInvoice(models.Model):
     task = models.ForeignKey(Task)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, related_name='invoices_created', on_delete=models.DO_NOTHING, blank=True, null=True
+    )
     title = models.CharField(max_length=200)
     fee = models.DecimalField(max_digits=19, decimal_places=4)
     client = models.ForeignKey(settings.AUTH_USER_MODEL, related_name='client_invoices')
-    developer = models.ForeignKey(settings.AUTH_USER_MODEL, related_name='developer_invoices')
+    developer = models.ForeignKey(settings.AUTH_USER_MODEL, related_name='developer_invoices', blank=True, null=True)
     currency = models.CharField(max_length=5, choices=CURRENCY_CHOICES, default=CURRENCY_CHOICES[0][0])
     payment_method = models.CharField(
         max_length=30, choices=TASK_PAYMENT_METHOD_CHOICES,
@@ -1267,10 +1769,18 @@ class TaskInvoice(models.Model):
     btc_address = models.CharField(max_length=40, validators=[validate_btc_address])
     btc_price = models.DecimalField(max_digits=18, decimal_places=8, blank=True, null=True)
     number = models.CharField(max_length=20, blank=True, null=True)
+    withhold_tunga_fee = models.BooleanField(
+        default=False,
+        help_text='Only participant portion will be paid if True, '
+                  'and all money paid will be distributed to participants'
+    )
+    tax_rate = models.DecimalField(
+        max_digits=19, decimal_places=4, default=0
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
-    def __unicode__(self):
+    def __str__(self):
         return self.summary
 
     class Meta:
@@ -1282,7 +1792,7 @@ class TaskInvoice(models.Model):
 
     @property
     def pay_pm(self):
-        if self.task.is_project and self.pm:
+        if self.task.is_project and self.task.pm:
             return self.task.pm_time_ratio * self.fee
         return 0
 
@@ -1290,8 +1800,8 @@ class TaskInvoice(models.Model):
         if amount is None:
             amount = self.fee
         if self.currency in CURRENCY_SYMBOLS:
-            return '%s%s' % (CURRENCY_SYMBOLS[self.currency], floatformat(amount, arg=-2))
-        return amount
+            return '{}{}'.format(CURRENCY_SYMBOLS[self.currency], floatformat(amount, arg=-2))
+        return amount or ''
     display_fee.short_description = 'Fee'
 
     @property
@@ -1300,31 +1810,98 @@ class TaskInvoice(models.Model):
 
     def get_amount_details(self, share=1):
         share = Decimal(share)
-        fee_portion = self.fee * share
-        fee_portion_dev = self.pay_dev * share
-        fee_portion_pm = self.pay_pm * share
+        fee_portion = Decimal(self.fee) * share
+        fee_portion_dev = Decimal(self.pay_dev) * share
+        fee_portion_pm = Decimal(self.pay_pm) * share
 
         processing_share = 0
         if self.payment_method == TASK_PAYMENT_METHOD_BITONIC:
             processing_share = Decimal(BITONIC_PAYMENT_COST_PERCENTAGE) * Decimal(0.01)
         elif self.payment_method == TASK_PAYMENT_METHOD_BANK:
             processing_share = Decimal(BANK_TRANSFER_PAYMENT_COST_PERCENTAGE) * Decimal(0.01)
+
+        processing_fee = self.payment_method == TASK_PAYMENT_METHOD_STRIPE and stripe_utils.calculate_payment_fee(fee_portion) or (Decimal(processing_share) * fee_portion)
+
         amount_details = dict(
             currency=CURRENCY_SYMBOLS.get(self.currency, ''),
             share=share,
             pledge=self.fee,
             portion=round_decimal(fee_portion, 2),
-            developer=round_decimal((1 - self.task.tunga_ratio_dev) * fee_portion_dev, 2),
-            pm=round_decimal((1 - self.task.tunga_ratio_pm) * fee_portion_pm, 2),
-            processing=round_decimal(Decimal(processing_share) * fee_portion, 2)
+            developer=round_decimal(Decimal(1 - self.task.tunga_ratio_dev) * fee_portion_dev, 2),
+            pm=round_decimal(Decimal(1 - self.task.tunga_ratio_pm) * fee_portion_pm, 2),
+            processing=round_decimal(processing_fee, 2)
         )
 
         amount_details['tunga'] = round_decimal(fee_portion - (amount_details['developer'] + amount_details['pm']), 2)
         amount_details['total'] = round_decimal(fee_portion + amount_details['processing'], 2)
-        amount_details['total_dev'] = round_decimal(fee_portion_dev + (processing_share * fee_portion_dev), 2)
-        amount_details['total_pm'] = round_decimal(fee_portion_pm + (processing_share * fee_portion_pm), 2)
+        amount_details['total_dev'] = round_decimal(Decimal(self.task.tunga_ratio_dev)*fee_portion_dev + processing_fee, 2)
+        amount_details['total_pm'] = round_decimal(Decimal(self.task.tunga_ratio_dev)*fee_portion_pm + processing_fee, 2)
+
+        vat = self.tax_rate
+        vat_amount = Decimal(vat) * Decimal(0.01) * amount_details['total']
+        amount_details['vat'] = vat
+        amount_details['vat_amount'] = round_decimal(vat_amount, 2)
+        amount_details['plus_tax'] = round_decimal(amount_details['total'] + vat_amount, 2)
         return amount_details
+
+    @property
+    def tax_ratio(self):
+        return Decimal(self.tax_rate) * Decimal(0.01)
 
     @property
     def summary(self):
         return self.number or '%s - Fee: %s' % (self.title, self.display_fee())
+
+
+@python_2_unicode_compatible
+class TaskInvoiceMeta(models.Model):
+    invoice = models.ForeignKey(Integration, on_delete=models.CASCADE)
+    meta_key = models.CharField(max_length=30)
+    meta_value = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return '{} | {}'.format(self.invoice, self.meta_key)
+
+    class Meta:
+        ordering = ['created_at']
+
+
+APPROVED_WITH_CHOICES = (
+    (1, 'By the Tunga onboarding procedure'),
+    (2, 'A skills testing platform'),
+    (3, 'Has worked on Tunga tasks successfully before'),
+)
+
+
+@python_2_unicode_compatible
+class SkillsApproval(models.Model):
+    participant = models.ForeignKey(Participation)
+    approved_with = models.IntegerField(
+        choices=APPROVED_WITH_CHOICES,
+        help_text=','.join(['%s - %s' % (item[0], item[1]) for item in APPROVED_WITH_CHOICES])
+    )
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='skills_approvals')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return '{} - {} | {}'.format(self.participant, self.created_by, self.approved_with)
+
+    @staticmethod
+    @allow_staff_or_superuser
+    def has_read_permission(request):
+        return True
+
+    @allow_staff_or_superuser
+    def has_object_read_permission(self, request):
+        return request.user.is_project_manager
+
+    @staticmethod
+    @allow_staff_or_superuser
+    def has_write_permission(request):
+        return request.user.is_project_manager
+
+    @allow_staff_or_superuser
+    def has_object_write_permission(self, request):
+        return request.user.is_project_manager and request.user == self.created_by

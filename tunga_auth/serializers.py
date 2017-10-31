@@ -1,3 +1,5 @@
+# -*- coding: utf-8 -*-
+
 import datetime
 
 from allauth.account.adapter import get_adapter
@@ -16,7 +18,7 @@ from rest_framework.exceptions import ValidationError
 from tunga_auth.forms import TungaPasswordResetForm
 from tunga_auth.models import USER_TYPE_CHOICES, EmailVisitor
 from tunga_profiles.notifications import send_developer_invitation_accepted_email
-from tunga_utils.constants import USER_TYPE_DEVELOPER
+from tunga_utils.constants import USER_TYPE_DEVELOPER, STATUS_REJECTED, STATUS_INITIAL, STATUS_ACCEPTED
 from tunga_profiles.models import Connection, DeveloperApplication, UserProfile, DeveloperInvitation
 from tunga_utils.mixins import GetCurrentUserAnnotatedSerializerMixin
 from tunga_utils.models import Rating
@@ -30,7 +32,7 @@ class UserSerializer(SimpleUserSerializer, GetCurrentUserAnnotatedSerializerMixi
     is_developer = serializers.BooleanField(read_only=True, required=False)
     is_project_owner = serializers.BooleanField(read_only=True, required=False)
     is_project_manager = serializers.BooleanField(read_only=True, required=False)
-    profile = SimpleProfileSerializer(read_only=True, required=False, source='userprofile')
+    profile = SimpleProfileSerializer(read_only=True, required=False)
     work = SimpleWorkSerializer(many=True, source='work_set', read_only=True, required=False)
     education = SimpleEducationSerializer(many=True, source='education_set', read_only=True, required=False)
     can_connect = serializers.SerializerMethodField(read_only=True, required=False)
@@ -57,8 +59,9 @@ class UserSerializer(SimpleUserSerializer, GetCurrentUserAnnotatedSerializerMixi
             has_requested = obj.connections_initiated.filter(to_user=current_user).count()
             if has_requested:
                 return False
-            has_accepted_or_been_requested = obj.connection_requests.filter(
-                Q(accepted=True) | Q(responded=False), from_user=current_user).count() > 0
+            has_accepted_or_been_requested = obj.connection_requests.exclude(
+                status=STATUS_REJECTED
+            ).filter(from_user=current_user).count() > 0
             return not has_accepted_or_been_requested
         return False
 
@@ -66,7 +69,7 @@ class UserSerializer(SimpleUserSerializer, GetCurrentUserAnnotatedSerializerMixi
         current_user = self.get_current_user()
         if current_user:
             try:
-                connection = obj.connections_initiated.get(to_user=current_user, responded=False)
+                connection = obj.connections_initiated.get(to_user=current_user, status=STATUS_INITIAL)
                 return connection.id
             except:
                 pass
@@ -88,13 +91,13 @@ class UserSerializer(SimpleUserSerializer, GetCurrentUserAnnotatedSerializerMixi
         return obj.tasks_created.count()
 
     def get_tasks_completed(self, obj):
-        return obj.participation_set.filter(task__closed=True, accepted=True).count()
+        return obj.participation_set.filter(task__closed=True, status=STATUS_ACCEPTED).count()
 
     def get_satisfaction(self, obj):
         score = None
         if obj.type == USER_TYPE_DEVELOPER:
             score = obj.participation_set.filter(
-                task__closed=True, accepted=True
+                task__closed=True, status=STATUS_ACCEPTED
             ).aggregate(satisfaction=Avg('task__satisfaction'))['satisfaction']
             if score:
                 score = '{:0,.0f}%'.format(score*10)
@@ -104,7 +107,7 @@ class UserSerializer(SimpleUserSerializer, GetCurrentUserAnnotatedSerializerMixi
         score = None
         if obj.type == USER_TYPE_DEVELOPER:
             query = Rating.objects.filter(
-                tasks__closed=True, tasks__participants=obj, tasks__participation__accepted=True
+                tasks__closed=True, tasks__participants=obj, tasks__participation__status=STATUS_ACCEPTED
             ).order_by('criteria')
             details = query.values('criteria').annotate(avg=Avg('score'))
             criteria_choices = dict(Rating._meta.get_field('criteria').flatchoices)
@@ -207,8 +210,8 @@ class TungaPasswordResetSerializer(PasswordResetSerializer):
 
     def get_email_options(self):
         return {
-            "email_template_name": "tunga/email/password_reset_email.html",
-            "html_email_template_name": "tunga/email/password_reset_email.html"
+            "email_template_name": "tunga/email/password_reset.html",
+            "html_email_template_name": "tunga/email/password_reset.html"
         }
 
 

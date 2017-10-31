@@ -4,6 +4,7 @@ import uuid
 
 import tagulous.models
 from django.db import models
+from django.utils.encoding import python_2_unicode_compatible
 from django_countries.fields import CountryField
 from dry_rest_permissions.generics import allow_staff_or_superuser
 
@@ -12,13 +13,32 @@ from tunga_profiles.validators import validate_email
 from tunga_utils.constants import REQUEST_STATUS_INITIAL, REQUEST_STATUS_ACCEPTED, REQUEST_STATUS_REJECTED, \
     BTC_WALLET_PROVIDER_COINBASE, PAYMENT_METHOD_BTC_WALLET, PAYMENT_METHOD_BTC_ADDRESS, PAYMENT_METHOD_MOBILE_MONEY, \
     COUNTRY_CODE_UGANDA, COUNTRY_CODE_TANZANIA, COUNTRY_CODE_NIGERIA, APP_INTEGRATION_PROVIDER_SLACK, \
-    APP_INTEGRATION_PROVIDER_HARVEST, USER_TYPE_PROJECT_MANAGER, USER_TYPE_DEVELOPER, USER_TYPE_PROJECT_OWNER
+    APP_INTEGRATION_PROVIDER_HARVEST, USER_TYPE_PROJECT_MANAGER, USER_TYPE_DEVELOPER, USER_TYPE_PROJECT_OWNER, \
+    STATUS_INITIAL, STATUS_ACCEPTED, STATUS_REJECTED, SKILL_TYPE_LANGUAGE, SKILL_TYPE_FRAMEWORK, \
+    SKILL_TYPE_PLATFORM, SKILL_TYPE_LIBRARY, SKILL_TYPE_STORAGE, SKILL_TYPE_API, \
+    SKILL_TYPE_OTHER
 from tunga_utils.helpers import get_serialized_id
 from tunga_utils.models import AbstractExperience
 from tunga_utils.validators import validate_btc_address
 
 
+SKILL_TYPE_CHOICES = (
+    (SKILL_TYPE_LANGUAGE, 'Language'),
+    (SKILL_TYPE_FRAMEWORK, 'Framework'),
+    (SKILL_TYPE_PLATFORM, 'Platform'),
+    (SKILL_TYPE_LIBRARY, 'Library'),
+    (SKILL_TYPE_STORAGE, 'Storage Engine'),
+    (SKILL_TYPE_API, 'API'),
+    (SKILL_TYPE_OTHER, 'Other')
+)
+
+
 class Skill(tagulous.models.TagModel):
+    type = models.CharField(
+        max_length=30, choices=SKILL_TYPE_CHOICES, default=SKILL_TYPE_OTHER,
+        help_text=','.join(['%s - %s' % (item[0], item[1]) for item in SKILL_TYPE_CHOICES])
+    )
+
     class TagMeta:
         initial = "PHP, JavaScript, Python, Ruby, Java, C#, C++, Ruby, Swift, Objective C, .NET, ASP.NET, Node.js," \
                   "HTML, CSS, HTML5, CSS3, XML, JSON, YAML," \
@@ -44,6 +64,7 @@ BTC_WALLET_PROVIDER_CHOICES = (
 )
 
 
+@python_2_unicode_compatible
 class BTCWallet(models.Model):
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
     provider = models.CharField(
@@ -62,7 +83,7 @@ class BTCWallet(models.Model):
         unique_together = ('user', 'provider')
         verbose_name = 'bitcoin wallet'
 
-    def __unicode__(self):
+    def __str__(self):
         return '%s - %s' % (self.user.get_short_name(), self.get_provider_display())
 
 
@@ -72,6 +93,7 @@ APP_INTEGRATION_PROVIDER_CHOICES = (
 )
 
 
+@python_2_unicode_compatible
 class AppIntegration(models.Model):
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
     provider = models.CharField(
@@ -92,7 +114,7 @@ class AppIntegration(models.Model):
         verbose_name = 'app integration'
         verbose_name_plural = 'app integrations'
 
-    def __unicode__(self):
+    def __str__(self):
         return '%s - %s' % (self.user.get_short_name(), self.get_provider_display())
 
 
@@ -109,9 +131,14 @@ MOBILE_MONEY_CC_CHOICES = (
 )
 
 
+@python_2_unicode_compatible
 class UserProfile(models.Model):
     user = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+
+    # Personal Info
     bio = models.TextField(blank=True, null=True)
+
+    # Contact Info
     country = CountryField(blank=True, null=True)
     city = tagulous.models.SingleTagField(to=City, blank=True, null=True)
     street = models.CharField(max_length=100, blank=True, null=True)
@@ -120,10 +147,11 @@ class UserProfile(models.Model):
     postal_address = models.CharField(max_length=100, blank=True, null=True)
     phone_number = models.CharField(max_length=15, blank=True, null=True)
 
-    id_document = models.ImageField(upload_to='ids/%Y/%m/%d', blank=True, null=True)
-
+    # Professional Info
     skills = tagulous.models.TagField(to=Skill, blank=True)
 
+    # KYC
+    id_document = models.ImageField(upload_to='ids/%Y/%m/%d', blank=True, null=True)
     company = models.CharField(max_length=200, blank=True, null=True)
     website = models.URLField(blank=True, null=True)
     company_profile = models.TextField(blank=True, null=True)
@@ -131,6 +159,7 @@ class UserProfile(models.Model):
     vat_number = models.CharField(max_length=50, blank=True, null=True)
     company_reg_no = models.CharField(max_length=50, blank=True, null=True)
 
+    # Payment Information
     payment_method = models.CharField(
         max_length=30, choices=PAYMENT_METHOD_CHOICES,
         help_text=','.join(['%s - %s' % (item[0], item[1]) for item in PAYMENT_METHOD_CHOICES]),
@@ -144,7 +173,11 @@ class UserProfile(models.Model):
         blank=True, null=True)
     mobile_money_number = models.CharField(max_length=15, blank=True, null=True)
 
-    def __unicode__(self):
+    # Tax Information
+    tax_name = models.CharField(max_length=200, blank=True, null=True)
+    tax_percentage = models.FloatField(blank=True, null=True)
+
+    def __str__(self):
         return self.user.get_short_name()
 
     @property
@@ -155,6 +188,13 @@ class UserProfile(models.Model):
     def country_name(self):
         return str(self.country.name)
 
+    @property
+    def location(self):
+        location = self.city_name
+        if self.country_name:
+            location = '{}{}{}'.format(location, location and ', ' or '', self.country_name)
+        return location
+
     @allow_staff_or_superuser
     def has_object_read_permission(self, request):
         return True
@@ -163,38 +203,66 @@ class UserProfile(models.Model):
     def has_object_write_permission(self, request):
         return request.user == self.user
 
+    def get_category_skills(self, skill_type):
+        return self.skills.filter(type=skill_type)
 
+    @property
+    def skills_details(self):
+        return dict(
+            language=self.get_category_skills(SKILL_TYPE_LANGUAGE),
+            framework=self.get_category_skills(SKILL_TYPE_FRAMEWORK),
+            platform=self.get_category_skills(SKILL_TYPE_PLATFORM),
+            library=self.get_category_skills(SKILL_TYPE_LIBRARY),
+            storage=self.get_category_skills(SKILL_TYPE_STORAGE),
+            api=self.get_category_skills(SKILL_TYPE_API),
+            other=self.get_category_skills(SKILL_TYPE_OTHER),
+        )
+
+
+@python_2_unicode_compatible
 class Education(AbstractExperience):
     institution = models.CharField(max_length=200)
     award = models.CharField(max_length=200)
 
-    def __unicode__(self):
+    def __str__(self):
         return '%s - %s' % (self.user.get_short_name, self.institution)
 
     class Meta:
         verbose_name_plural = 'education'
 
 
+@python_2_unicode_compatible
 class Work(AbstractExperience):
     company = models.CharField(max_length=200)
     position = models.CharField(max_length=200)
 
-    def __unicode__(self):
+    def __str__(self):
         return '%s - %s' % (self.user.get_short_name, self.company)
 
     class Meta:
         verbose_name_plural = 'work'
 
+CONNECTION_STATUS_CHOICES = (
+    (STATUS_INITIAL, 'Initial'),
+    (STATUS_ACCEPTED, 'Accepted'),
+    (STATUS_REJECTED, 'Rejected')
+)
 
+
+@python_2_unicode_compatible
 class Connection(models.Model):
     from_user = models.ForeignKey(
             settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='connections_initiated')
     to_user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='connection_requests')
     accepted = models.BooleanField(default=False)
     responded = models.BooleanField(default=False)
+    status = models.CharField(
+        max_length=30, choices=CONNECTION_STATUS_CHOICES, default=STATUS_INITIAL,
+        help_text=', '.join(['%s - %s' % (item[0], item[1]) for item in CONNECTION_STATUS_CHOICES])
+    )
     created_at = models.DateTimeField(auto_now_add=True)
 
-    def __unicode__(self):
+    def __str__(self):
         return '%s -> %s' % (self.from_user.get_short_name, self.to_user.get_short_name)
 
     class Meta:
@@ -216,6 +284,7 @@ APPLICATION_STATUS_CHOICES = (
 )
 
 
+@python_2_unicode_compatible
 class DeveloperApplication(models.Model):
     first_name = models.CharField(max_length=30)
     last_name = models.CharField(max_length=30)
@@ -227,9 +296,9 @@ class DeveloperApplication(models.Model):
     experience = models.TextField()
     discovery_story = models.TextField()
     status = models.PositiveSmallIntegerField(
-            choices=APPLICATION_STATUS_CHOICES,
-            help_text=','.join(['%s - %s' % (item[0], item[1]) for item in APPLICATION_STATUS_CHOICES]),
-            default=REQUEST_STATUS_INITIAL
+        choices=APPLICATION_STATUS_CHOICES,
+        help_text=','.join(['%s - %s' % (item[0], item[1]) for item in APPLICATION_STATUS_CHOICES]),
+        default=REQUEST_STATUS_INITIAL
     )
     created_at = models.DateTimeField(auto_now_add=True)
     confirmation_key = models.UUIDField(default=uuid.uuid4, editable=False, unique=True)
@@ -237,7 +306,7 @@ class DeveloperApplication(models.Model):
     used = models.BooleanField(default=False)
     used_at = models.DateTimeField(blank=True, null=True, editable=False)
 
-    def __unicode__(self):
+    def __str__(self):
         return self.display_name
 
     @property
@@ -257,6 +326,7 @@ USER_TYPE_CHOICES = (
 )
 
 
+@python_2_unicode_compatible
 class DeveloperInvitation(models.Model):
     first_name = models.CharField(max_length=30)
     last_name = models.CharField(max_length=30)
@@ -274,7 +344,7 @@ class DeveloperInvitation(models.Model):
     class Meta:
         verbose_name = 'user invitation'
 
-    def __unicode__(self):
+    def __str__(self):
         return self.display_name
 
     @property
@@ -282,6 +352,7 @@ class DeveloperInvitation(models.Model):
         return '%s %s' % (self.first_name, self.last_name)
 
 
+@python_2_unicode_compatible
 class UserNumber(models.Model):
     """
     Helper table for generating user numbers in a sequence
@@ -289,7 +360,7 @@ class UserNumber(models.Model):
     user = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
     created_at = models.DateTimeField(auto_now_add=True)
 
-    def __unicode__(self):
+    def __str__(self):
         return self.number
 
     class Meta:
@@ -314,12 +385,13 @@ class DeveloperNumber(UserNumber):
     pass
 
 
+@python_2_unicode_compatible
 class Inquirer(models.Model):
-    name = models.CharField(max_length=50)
+    name = models.CharField(max_length=50, blank=True, null=True)
     email = models.EmailField(blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
-    def __unicode__(self):
+    def __str__(self):
         return '%s (%s)' % (self.name, self.email or self.id)
 
     class Meta:

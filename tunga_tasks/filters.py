@@ -1,7 +1,11 @@
+# -*- coding: utf-8 -*-
+
 import django_filters
+from django.db.models.query_utils import Q
 
 from tunga_tasks.models import Task, Application, Participation, TimeEntry, Project, ProgressReport, ProgressEvent, \
-    Estimate, Quote
+    Estimate, Quote, TaskPayment, ParticipantPayment, SkillsApproval, Sprint
+from tunga_utils.constants import TASK_PAYMENT_METHOD_STRIPE
 from tunga_utils.filters import GenericDateFilterSet
 
 
@@ -30,26 +34,35 @@ class TaskFilter(GenericDateFilterSet):
     def filter_payment_status(self, queryset, name, value):
         queryset = queryset.filter(closed=True)
         if value in ['paid', 'processing']:
-            queryset = queryset.filter(paid=True)
+            request = self.request
+            is_po = request and request.user and request.user.is_authenticated() and request.user.is_project_owner and not request.user.is_admin
             if value == 'paid':
-                return queryset.filter(pay_distributed=True)
+                return is_po and queryset or queryset.filter(paid=True, pay_distributed=True)
             else:
-                return queryset.filter(pay_distributed=False)
+                processing_filter = (Q(processing=True) & Q(paid=False))
+                if not is_po:
+                    processing_filter = processing_filter | (Q(paid=True) & Q(pay_distributed=False))
+                return queryset.filter(processing_filter)
         elif value == 'pending':
-            queryset = queryset.filter(paid=False)
+            queryset = queryset.filter(processing=False, paid=False)
+        elif value == 'distribute':
+            queryset = queryset.filter(
+                payment_method=TASK_PAYMENT_METHOD_STRIPE,
+                paid=True, btc_paid=False, pay_distributed=False
+            )
         return queryset
 
 
 class ApplicationFilter(GenericDateFilterSet):
     class Meta:
         model = Application
-        fields = ('user', 'task', 'accepted', 'responded')
+        fields = ('user', 'task', 'status')
 
 
 class ParticipationFilter(GenericDateFilterSet):
     class Meta:
         model = Participation
-        fields = ('user', 'task', 'accepted')
+        fields = ('user', 'task', 'status')
 
 
 class EstimateFilter(GenericDateFilterSet):
@@ -63,6 +76,13 @@ class QuoteFilter(GenericDateFilterSet):
 
     class Meta:
         model = Quote
+        fields = ('user', 'task', 'status', 'moderated_by')
+
+
+class SprintFilter(GenericDateFilterSet):
+
+    class Meta:
+        model = Sprint
         fields = ('user', 'task', 'status', 'moderated_by')
 
 
@@ -91,3 +111,31 @@ class ProgressReportFilter(GenericDateFilterSet):
     class Meta:
         model = ProgressReport
         fields = ('user', 'event', 'task', 'event_type', 'status')
+
+
+class TaskPaymentFilter(GenericDateFilterSet):
+    user = django_filters.NumberFilter(name='task_user')
+    owner = django_filters.NumberFilter(name='task_owner')
+
+    class Meta:
+        model = TaskPayment
+        fields = ('task', 'ref', 'payment_type', 'btc_address', 'processed', 'paid', 'captured', 'user', 'owner')
+
+
+class ParticipantPaymentFilter(GenericDateFilterSet):
+    user = django_filters.NumberFilter(name='participant__user')
+    task = django_filters.NumberFilter(name='source__task')
+
+    class Meta:
+        model = ParticipantPayment
+        fields = ('participant', 'source', 'destination', 'ref', 'idem_key', 'status', 'user', 'task')
+
+
+class SkillsApprovalFilter(GenericDateFilterSet):
+    developer = django_filters.NumberFilter(name='participant__user')
+    task = django_filters.NumberFilter(name='participant__task')
+    event_type = django_filters.NumberFilter(name='event__type')
+
+    class Meta:
+        model = SkillsApproval
+        fields = ('created_by', 'developer', 'task', 'participant', 'approved_with')

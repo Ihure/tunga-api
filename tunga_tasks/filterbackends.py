@@ -1,3 +1,5 @@
+# -*- coding: utf-8 -*-
+
 import datetime
 
 from dateutil.relativedelta import relativedelta
@@ -12,7 +14,7 @@ from dry_rest_permissions.generics import DRYPermissionFiltersBase
 from tunga_profiles.models import UserProfile
 from tunga_utils.constants import VISIBILITY_DEVELOPER, \
     VISIBILITY_MY_TEAM, TASK_SCOPE_TASK, TASK_SCOPE_ONGOING, TASK_SCOPE_PROJECT, TASK_SOURCE_NEW_USER, STATUS_APPROVED, \
-    STATUS_ACCEPTED
+    STATUS_ACCEPTED, STATUS_INITIAL
 from tunga_utils.filterbackends import dont_filter_staff_or_superuser
 
 
@@ -38,27 +40,25 @@ class TaskFilterBackend(DRYPermissionFiltersBase):
             if label_filter == 'running':
                 queryset = queryset.filter(closed=False)
             elif label_filter == 'payments':
-                queryset = queryset.filter(closed=True).order_by('paid', 'pay_distributed', '-created_at')
+                queryset = queryset.filter(closed=True).order_by('paid', 'pay_distributed', 'processing', '-created_at')
             if label_filter != 'payments' or not request.user.is_admin:
                 queryset = queryset.filter(
                     Q(user=request.user) |
+                    Q(owner=request.user) |
                     (
-                        Q(participation__user=request.user) &
-                        (
-                            Q(participation__accepted=True) | Q(participation__responded=False)
-                        )
+                        Q(participation__user=request.user) & Q(participation__status__in=[STATUS_INITIAL, STATUS_ACCEPTED])
                     )
                 )
-        elif label_filter in ['new-projects', 'estimates', 'quotes']:
+        elif label_filter in ['new-projects', 'estimates', 'quotes', 'proposals']:
             queryset = queryset.exclude(scope=TASK_SCOPE_TASK)
             if label_filter == 'new-projects':
                 queryset = queryset.filter(pm__isnull=True)
-            elif label_filter in ['estimates', 'quotes']:
+            elif label_filter in ['estimates', 'quotes', 'proposals']:
                 if request.user.is_project_manager:
                     queryset = queryset.filter(pm=request.user)
-                if label_filter == 'estimates':
+                if label_filter in ['estimates', 'proposals']:
                     queryset = queryset.exclude(estimate__status=STATUS_ACCEPTED)
-                if label_filter == 'quotes':
+                elif label_filter == 'quotes':
                     queryset = queryset.filter(estimate__status=STATUS_ACCEPTED).exclude(quote__status=STATUS_ACCEPTED)
         elif label_filter == 'skills':
             try:
@@ -84,11 +84,11 @@ class TaskFilterBackend(DRYPermissionFiltersBase):
             queryset = queryset.filter(
                 (
                     Q(user__connections_initiated__to_user=request.user) &
-                    Q(user__connections_initiated__accepted=True)
+                    Q(user__connections_initiated__status=STATUS_ACCEPTED)
                 ) |
                 (
                     Q(user__connection_requests__from_user=request.user) &
-                    Q(user__connection_requests__accepted=True)
+                    Q(user__connection_requests__status=STATUS_ACCEPTED)
                 )
             )
 
@@ -96,9 +96,13 @@ class TaskFilterBackend(DRYPermissionFiltersBase):
             if request.user.is_staff or request.user.is_superuser:
                 return queryset
             if request.user.is_project_owner:
-                queryset = queryset.filter(Q(user=request.user) | Q(taskaccess__user=request.user))
+                queryset = queryset.filter(Q(user=request.user) | Q(owner=request.user) | Q(taskaccess__user=request.user))
             elif request.user.is_developer:
-                return queryset.exclude(approved=False).filter(
+                return queryset.exclude(
+                    approved=False
+                ).exclude(
+                    ~Q(participation__user=request.user), review=True
+                ).filter(
                     Q(scope=TASK_SCOPE_TASK) |
                     (
                         Q(scope=TASK_SCOPE_PROJECT) & Q(pm_required=False) & ~Q(source=TASK_SOURCE_NEW_USER)
@@ -117,7 +121,7 @@ class TaskFilterBackend(DRYPermissionFiltersBase):
                                 ) |
                                 (
                                     Q(user__connection_requests__from_user=request.user) &
-                                    Q(user__connection_requests__accepted=True)
+                                    Q(user__connection_requests__status=STATUS_ACCEPTED)
                                 )
                             )
                         )
@@ -126,6 +130,7 @@ class TaskFilterBackend(DRYPermissionFiltersBase):
             elif request.user.is_project_manager:
                 queryset = queryset.filter(
                     Q(user=request.user) |
+                    Q(pm=request.user) |
                     Q(taskaccess__user=request.user) | (
                         Q(scope=TASK_SCOPE_ONGOING) |
                         (
@@ -156,9 +161,7 @@ class ParticipationFilterBackend(DRYPermissionFiltersBase):
             Q(task__user=request.user) |
             (
                 Q(task__participation__user=request.user) &
-                (
-                    Q(task__participation__accepted=True) | Q(task__participation__responded=False)
-                )
+                Q(task__participation__status__in=[STATUS_INITIAL, STATUS_ACCEPTED])
             )
         )
 
@@ -176,7 +179,7 @@ class ProgressEventFilterBackend(DRYPermissionFiltersBase):
         threshold_date = datetime.datetime.utcnow() - relativedelta(hours=24)
         if label_filter == 'upcoming':
             queryset = queryset.filter(
-                due_at__gt=threshold_date, progressreport__isnull=False
+                due_at__gt=threshold_date, progressreport__isnull=True
             )
         elif label_filter in ['complete', 'finished']:
             queryset = queryset.filter(
@@ -193,9 +196,7 @@ class ProgressEventFilterBackend(DRYPermissionFiltersBase):
             Q(task__user=request.user) |
             (
                 Q(task__participation__user=request.user) &
-                (
-                    Q(task__participation__accepted=True) | Q(task__participation__responded=False)
-                )
+                Q(task__participation__status__in=[STATUS_INITIAL, STATUS_ACCEPTED])
             )
         )
 
@@ -208,8 +209,6 @@ class ProgressReportFilterBackend(DRYPermissionFiltersBase):
             Q(event__task__user=request.user) |
             (
                 Q(event__task__participation__user=request.user) &
-                (
-                    Q(event__task__participation__accepted=True) | Q(event__task__participation__responded=False)
-                )
+                Q(event__task__participation__status__in=[STATUS_INITIAL, STATUS_ACCEPTED])
             )
         )

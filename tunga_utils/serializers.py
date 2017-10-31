@@ -1,3 +1,5 @@
+# -*- coding: utf-8 -*-
+
 from django.contrib.auth import get_user_model
 from django.contrib.contenttypes.models import ContentType
 from django_countries.serializer_fields import CountryField
@@ -6,6 +8,8 @@ from rest_framework.fields import SkipField
 
 from tunga_profiles.models import Skill, City, UserProfile, Education, Work, Connection, BTCWallet
 from tunga_profiles.utils import profile_check
+from tunga_tasks.models import TaskInvoice
+from tunga_utils.mixins import GetCurrentUserAnnotatedSerializerMixin
 from tunga_utils.models import GenericUpload, ContactRequest, Upload, AbstractExperience, Rating
 
 
@@ -49,7 +53,7 @@ class DetailAnnotatedModelSerializer(serializers.ModelSerializer):
 class SkillSerializer(serializers.ModelSerializer):
     class Meta:
         model = Skill
-        fields = ('id', 'name', 'slug')
+        fields = ('id', 'name', 'slug', 'type')
 
 
 class CitySerializer(serializers.ModelSerializer):
@@ -72,11 +76,21 @@ class SimpleUserSerializer(serializers.ModelSerializer):
         model = get_user_model()
         fields = (
             'id', 'username', 'email', 'first_name', 'last_name', 'display_name', 'short_name', 'type', 'image',
-            'is_developer', 'is_project_owner', 'is_project_manager', 'is_staff', 'verified', 'company', 'avatar_url', 'can_contribute'
+            'is_developer', 'is_project_owner', 'is_project_manager', 'is_staff', 'verified', 'company', 'avatar_url',
+            'can_contribute', 'date_joined'
         )
 
     def get_can_contribute(self, obj):
         return profile_check(obj)
+
+
+class SkillsDetailsSerializer(serializers.Serializer):
+
+    def to_representation(self, instance):
+        json = dict()
+        for category in instance:
+            json[category] = SkillSerializer(instance=instance[category], many=True).data
+        return json
 
 
 class SimpleProfileSerializer(serializers.ModelSerializer):
@@ -85,10 +99,35 @@ class SimpleProfileSerializer(serializers.ModelSerializer):
     country = CountryField()
     country_name = serializers.CharField()
     btc_wallet = SimpleBTCWalletSerializer()
+    skills_details = SkillsDetailsSerializer()
 
     class Meta:
         model = UserProfile
         exclude = ('user',)
+
+
+class SimpleSkillsProfileSerializer(serializers.ModelSerializer):
+    city = serializers.CharField()
+    skills = SkillSerializer(many=True)
+    country = CountryField()
+    country_name = serializers.CharField()
+    skills_details = SkillsDetailsSerializer()
+
+    class Meta:
+        model = UserProfile
+        fields = ('id', 'skills', 'country', 'country_name', 'city', 'bio', 'skills_details')
+
+
+class SimpleUserSkillsProfileSerializer(SimpleUserSerializer):
+    profile = SimpleSkillsProfileSerializer(read_only=True, required=False)
+
+    class Meta(SimpleUserSerializer.Meta):
+        model = get_user_model()
+        fields = (
+            'id', 'username', 'first_name', 'last_name',
+            'display_name', 'short_name', 'type',
+            'image', 'avatar_url', 'profile'
+        )
 
 
 class InvoiceUserSerializer(serializers.ModelSerializer):
@@ -188,3 +227,24 @@ class SimpleRatingSerializer(ContentTypeAnnotatedModelSerializer):
         model = Rating
         exclude = ('content_type', 'object_id', 'created_at')
 
+
+class TaskInvoiceSerializer(serializers.ModelSerializer, GetCurrentUserAnnotatedSerializerMixin):
+    client = InvoiceUserSerializer(required=False, read_only=True)
+    developer = InvoiceUserSerializer(required=False, read_only=True)
+    amount = serializers.JSONField(required=False, read_only=True)
+    developer_amount = serializers.SerializerMethodField(required=False, read_only=True)
+
+    class Meta:
+        model = TaskInvoice
+        fields = '__all__'
+
+    def get_developer_amount(self, obj):
+        current_user = self.get_current_user()
+        if current_user and current_user.is_developer:
+            try:
+                participation = obj.task.participation_set.get(user=current_user)
+                share = obj.task.get_user_participation_share(participation.id)
+                return obj.get_amount_details(share=share)
+            except:
+                pass
+        return obj.get_amount_details(share=0)

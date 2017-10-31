@@ -1,11 +1,9 @@
 from django.contrib.auth import get_user_model
-from django.db.models.query_utils import Q
 from django_rq.decorators import job
 
-from tunga.settings import EMAIL_SUBJECT_PREFIX, TUNGA_URL, SLACK_CUSTOMER_INCOMING_WEBHOOK, SLACK_CUSTOMER_BOT_NAME, \
-    SLACK_ATTACHMENT_COLOR_GREEN, TUNGA_ICON_URL_150
+from tunga.settings import TUNGA_URL, SLACK_STAFF_INCOMING_WEBHOOK, \
+    TUNGA_ICON_URL_150, SLACK_ATTACHMENT_COLOR_TUNGA, SLACK_STAFF_CUSTOMER_CHANNEL
 from tunga_messages.models import Message
-from tunga_settings.slugs import DIRECT_MESSAGES_EMAIL
 from tunga_utils import slack_utils
 from tunga_utils.constants import CHANNEL_TYPE_SUPPORT, APP_INTEGRATION_PROVIDER_SLACK, CHANNEL_TYPE_DEVELOPER, \
     USER_TYPE_DEVELOPER
@@ -27,7 +25,7 @@ def notify_new_message_email(instance):
     if recipients:
         to = [recipient.email for recipient in recipients]
     if to and isinstance(to, (list, tuple)):
-        subject = "%s New message from %s" % (EMAIL_SUBJECT_PREFIX, instance.sender.short_name)
+        subject = "New message from {}".format(instance.sender.short_name)
         ctx = {
             'sender': instance.sender.short_name,
             'subject': instance.channel.subject,
@@ -35,7 +33,7 @@ def notify_new_message_email(instance):
             'message': instance,
             'message_url': '%s/conversation/%s/' % (TUNGA_URL, instance.channel_id)
         }
-        send_mail(subject, 'tunga/email/email_new_message', to, ctx)
+        send_mail(subject, 'tunga/email/new_message', to, ctx)
 
 
 @job
@@ -46,16 +44,13 @@ def notify_new_message_slack(instance):
             # Ignore messages from admins
             return
         channel_url = '%s/help/%s/' % (TUNGA_URL, instance.channel_id)
-        summary = "New message from %s" % instance.sender.short_name
         message_details = {
-            slack_utils.KEY_PRETEXT: summary,
             slack_utils.KEY_AUTHOR_NAME: instance.sender.display_name,
-            slack_utils.KEY_TEXT: '%s\n\n<%s|View on Tunga>' % (instance.text_body, channel_url),
+            slack_utils.KEY_TEXT: instance.text_body,
             slack_utils.KEY_MRKDWN_IN: [slack_utils.KEY_TEXT, slack_utils.KEY_FOOTER],
-            slack_utils.KEY_COLOR: SLACK_ATTACHMENT_COLOR_GREEN,
-            slack_utils.KEY_FOOTER: 'Tunga | Type C%s <your reply here>' % instance.channel_id,
+            slack_utils.KEY_COLOR: SLACK_ATTACHMENT_COLOR_TUNGA,
+            slack_utils.KEY_FOOTER: 'Type C{} <your reply here>'.format(instance.channel_id),
             slack_utils.KEY_FOOTER_ICON: TUNGA_ICON_URL_150,
-            slack_utils.KEY_FALLBACK: summary,
         }
         if instance.channel.subject:
             message_details[slack_utils.KEY_TITLE] = instance.channel.subject
@@ -64,7 +59,11 @@ def notify_new_message_slack(instance):
             inquirer = instance.channel.get_inquirer()
             if inquirer:
                 try:
-                    message_details[slack_utils.KEY_TITLE] = 'Help: %s' % inquirer.name
+                    message_details[slack_utils.KEY_TITLE] = 'Help{}{}'.format(
+                        inquirer.name and ': ' or '', inquirer.name or ''
+                    )
+                    if inquirer.email:
+                        message_details[slack_utils.KEY_TEXT] += '\n\nEmail: {}'.format(inquirer.email)
                     message_details[slack_utils.KEY_TITLE_LINK] = channel_url
                 except:
                     pass
@@ -78,11 +77,15 @@ def notify_new_message_slack(instance):
             pass
 
         slack_msg = {
+            slack_utils.KEY_TEXT: "New message from {} | <{}|View on Tunga>".format(
+                instance.sender.short_name, channel_url
+            ),
+            slack_utils.KEY_CHANNEL: SLACK_STAFF_CUSTOMER_CHANNEL,
             slack_utils.KEY_ATTACHMENTS: [
                 message_details
             ],
         }
-        slack_utils.send_incoming_webhook(SLACK_CUSTOMER_INCOMING_WEBHOOK, slack_msg)
+        slack_utils.send_incoming_webhook(SLACK_STAFF_INCOMING_WEBHOOK, slack_msg)
 
 
 @job
@@ -97,8 +100,8 @@ def notify_new_message_developers(instance):
             bcc = recipients[1:] if len(recipients) > 1 else None
 
             if to and isinstance(to, (list, tuple)):
-                subject = "%s Developer Notification: %s" % (
-                    EMAIL_SUBJECT_PREFIX, instance.channel.subject or instance.sender.short_name
+                subject = "Developer Notification: {}".format(
+                    instance.channel.subject or instance.sender.short_name
                 )
                 ctx = {
                     'sender': instance.sender.short_name,
@@ -107,4 +110,4 @@ def notify_new_message_developers(instance):
                     'message': instance,
                     'message_url': '%s/conversation/%s/' % (TUNGA_URL, instance.channel_id)
                 }
-                send_mail(subject, 'tunga/email/email_new_message', to, ctx, bcc=bcc)
+                send_mail(subject, 'tunga/email/new_message', to, ctx, bcc=bcc)

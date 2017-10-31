@@ -1,5 +1,8 @@
-from actstream.signals import action
+# -*- coding: utf-8 -*-
+
 from decimal import Decimal
+
+from actstream.signals import action
 from django.db.models.signals import post_save
 from django.dispatch.dispatcher import receiver, Signal
 
@@ -7,19 +10,28 @@ from tunga_activity import verbs
 from tunga_messages.models import Message
 from tunga_messages.tasks import get_or_create_task_channel
 from tunga_tasks.models import Task, Application, Participation, ProgressEvent, ProgressReport, \
-    IntegrationActivity, Integration, Estimate, Quote
-from tunga_tasks.notifications import notify_new_task_application, send_new_task_application_applicant_email, \
-    send_new_task_invitation_email, send_new_task_application_response_email, notify_task_invitation_response, \
-    send_task_application_not_selected_email, notify_new_progress_report, notify_task_approved, send_estimate_status_email
+    IntegrationActivity, Integration, Estimate, Quote, Sprint
+from tunga_tasks.notifications.email import notify_estimate_status_email, notify_task_invitation_email, \
+    send_task_application_not_selected_email, notify_payment_link_client_email
+from tunga_tasks.notifications.generic import notify_new_task, \
+    notify_task_approved, notify_new_task_admin, notify_task_invitation_response, notify_new_task_application, \
+    notify_task_application_response, notify_new_progress_report
+from tunga_tasks.notifications.slack import notify_new_progress_report_slack
 from tunga_tasks.tasks import initialize_task_progress_events, update_task_periodic_updates, \
-    complete_harvest_integration
+    complete_harvest_integration, create_or_update_hubspot_deal_task
+from tunga_utils import hubspot_utils
 from tunga_utils.constants import APP_INTEGRATION_PROVIDER_HARVEST, STATUS_SUBMITTED, STATUS_APPROVED, STATUS_DECLINED, \
-    STATUS_ACCEPTED, STATUS_REJECTED
+    STATUS_ACCEPTED, STATUS_REJECTED, STATUS_INITIAL
 
 # Task
+task_fully_saved = Signal(providing_args=["task", "new_user"])
 task_approved = Signal(providing_args=["task"])
+task_call_window_scheduled = Signal(providing_args=["task"])
+task_details_completed = Signal(providing_args=["task"])
+task_owner_added = Signal(providing_args=["task"])
 task_applications_closed = Signal(providing_args=["task"])
 task_closed = Signal(providing_args=["task"])
+task_payment_approved = Signal(providing_args=["task"])
 
 # Applications
 application_response = Signal(providing_args=["application"])
@@ -46,11 +58,43 @@ def activity_handler_new_task(sender, instance, created, **kwargs):
 
         initialize_task_progress_events.delay(instance.id)
 
+    # Create or Update HubSpot deal
+    create_or_update_hubspot_deal_task.delay(instance.id)
+
+
+@receiver(task_fully_saved, sender=Task)
+def activity_handler_task_fully_saved(sender, task, new_user, **kwargs):
+    notify_new_task.delay(task.id, new_user=new_user)
+    create_or_update_hubspot_deal_task.delay(task.id)
+
+    # if new_user:
+    #    possibly_trigger_schedule_call_automation.delay(task.id)
+
 
 @receiver(task_approved, sender=Task)
 def activity_handler_task_approved(sender, task, **kwargs):
     if task.approved and task.is_task:
         notify_task_approved.delay(task.id)
+
+    create_or_update_hubspot_deal_task.delay(task.id)
+
+
+@receiver(task_call_window_scheduled, sender=Task)
+def activity_handler_call_window_scheduled(sender, task, **kwargs):
+    # Notify admins
+    notify_new_task_admin.delay(task.id, call_scheduled=True)
+
+    # Update HubSpot deal stage
+    create_or_update_hubspot_deal_task.delay(task.id, **{hubspot_utils.KEY_DEALSTAGE: hubspot_utils.KEY_VALUE_APPOINTMENT_SCHEDULED})
+
+
+@receiver(task_details_completed, sender=Task)
+def activity_handler_task_details_completed(sender, task, **kwargs):
+    # Notify admins of more task details
+    notify_new_task_admin.delay(task.id, completed=True)
+
+    # Update HubSpot deal stage
+    create_or_update_hubspot_deal_task.delay(task.id)
 
 
 @receiver(task_applications_closed, sender=Task)
@@ -67,6 +111,14 @@ def activity_handler_task_closed(sender, task, **kwargs):
         action.send(task.user, verb=verbs.CLOSE, target=task)
 
 
+@receiver(task_payment_approved, sender=Task)
+def activity_handler_task_payment_approved(sender, task, **kwargs):
+    if task.payment_approved:
+        action.send(task.payment_approved_by, verb=verbs.APPROVE_PAYMENT, target=task)
+
+        notify_payment_link_client_email.delay(task.id)
+
+
 @receiver(post_save, sender=Application)
 def activity_handler_new_application(sender, instance, created, **kwargs):
     if created:
@@ -77,25 +129,22 @@ def activity_handler_new_application(sender, instance, created, **kwargs):
             channel = get_or_create_task_channel(instance.user, instance)
             Message.objects.create(channel=channel, **{'user': instance.user, 'body': instance.remarks})
 
-        # Send email notification to project owner
+        # Notify new application
         notify_new_task_application.delay(instance.id)
-
-        # Send email confirmation to applicant
-        send_new_task_application_applicant_email.delay(instance.id)
 
 
 @receiver(application_response, sender=Application)
 def activity_handler_application_response(sender, application, **kwargs):
-    if application.accepted or application.responded:
-        status_verb = application.accepted and verbs.ACCEPT or verbs.REJECT
+    if application.status != STATUS_INITIAL:
+        status_verb = application.status == STATUS_ACCEPTED and verbs.ACCEPT or verbs.REJECT
         action.send(
             application.task.user, verb=status_verb, action_object=application, target=application.task
         )
-        send_new_task_application_response_email.delay(application.id)
+        notify_task_application_response.delay(application.id)
 
-        if application.accepted and application.hours_needed and application.task.is_task:
+        if application.status == STATUS_ACCEPTED and application.hours_needed and application.task.is_task:
             task = application.task
-            task.bid = Decimal(application.hours_needed)*application.task.dev_rate
+            task.bid = Decimal(application.hours_needed) * application.task.dev_rate
             task.save()
 
 
@@ -104,23 +153,23 @@ def activity_handler_new_participant(sender, instance, created, **kwargs):
     if created:
         action.send(instance.created_by, verb=verbs.ADD, action_object=instance, target=instance.task)
 
-        if not instance.responded and not instance.accepted:
-            send_new_task_invitation_email.delay(instance.id)
+        if instance.status == STATUS_INITIAL:
+            notify_task_invitation_email.delay(instance.id)
 
-        if instance.accepted:
+        if instance.status == STATUS_ACCEPTED:
             update_task_periodic_updates.delay(instance.task.id)
 
 
 @receiver(participation_response, sender=Participation)
 def activity_handler_participation_response(sender, participation, **kwargs):
-    if participation.accepted or participation.responded:
-        status_verb = participation.accepted and verbs.ACCEPT or verbs.REJECT
+    if participation.status != STATUS_INITIAL:
+        status_verb = participation.status == STATUS_ACCEPTED and verbs.ACCEPT or verbs.REJECT
         action.send(
             participation.task.user, verb=status_verb, action_object=participation, target=participation.task
         )
         notify_task_invitation_response.delay(participation.id)
 
-        if participation.accepted:
+        if participation.status == STATUS_ACCEPTED:
             update_task_periodic_updates.delay(participation.task.id)
 
 
@@ -128,8 +177,8 @@ def activity_handler_participation_response(sender, participation, **kwargs):
 def activity_handler_estimate(sender, instance, created, **kwargs):
     if created:
         action.send(
-                instance.user, verb=verbs.CREATE,
-                action_object=instance, target=instance.task
+            instance.user, verb=verbs.CREATE,
+            action_object=instance, target=instance.task
         )
 
 
@@ -137,8 +186,17 @@ def activity_handler_estimate(sender, instance, created, **kwargs):
 def activity_handler_quote(sender, instance, created, **kwargs):
     if created:
         action.send(
-                instance.user, verb=verbs.CREATE,
-                action_object=instance, target=instance.task
+            instance.user, verb=verbs.CREATE,
+            action_object=instance, target=instance.task
+        )
+
+
+@receiver(post_save, sender=Sprint)
+def activity_handler_estimate(sender, instance, created, **kwargs):
+    if created:
+        action.send(
+            instance.user, verb=verbs.CREATE,
+            action_object=instance, target=instance.task
         )
 
 
@@ -146,8 +204,8 @@ def activity_handler_quote(sender, instance, created, **kwargs):
 def activity_handler_progress_event(sender, instance, created, **kwargs):
     if created:
         action.send(
-                instance.created_by or instance.task.user, verb=verbs.CREATE,
-                action_object=instance, target=instance.task
+            instance.created_by or instance.task.user, verb=verbs.CREATE,
+            action_object=instance, target=instance.task
         )
 
 
@@ -157,6 +215,8 @@ def activity_handler_progress_report(sender, instance, created, **kwargs):
         action.send(instance.user, verb=verbs.REPORT, action_object=instance, target=instance.event)
 
         notify_new_progress_report.delay(instance.id)
+    else:
+        notify_new_progress_report_slack.delay(instance.id, updated=True)
 
 
 @receiver(post_save, sender=Integration)
@@ -199,7 +259,13 @@ def activity_handler_estimate_status_changed(sender, estimate, **kwargs):
             action_user = estimate.reviewed_by
         action.send(action_user or estimate, verb=action_verb, action_object=estimate, target=estimate.task)
 
-    send_estimate_status_email(estimate.id)
+    if estimate.status == STATUS_ACCEPTED:
+        task = estimate.task
+        task.approved = True
+        task.bid = estimate.fee
+        task.save()
+
+    notify_estimate_status_email(estimate.id)
 
 
 @receiver(quote_status_changed, sender=Quote)
@@ -221,6 +287,4 @@ def activity_handler_quote_status_changed(sender, quote, **kwargs):
         task.bid = quote.fee
         task.save()
 
-    send_estimate_status_email(quote.id, estimate_type='quote')
-
-
+    notify_estimate_status_email(quote.id, estimate_type='quote')

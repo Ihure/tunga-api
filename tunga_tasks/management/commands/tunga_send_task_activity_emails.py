@@ -9,7 +9,7 @@ from django.db.models.expressions import Case, When, F
 from django.db.models.fields import IntegerField
 from django.db.models.query_utils import Q
 
-from tunga.settings import EMAIL_SUBJECT_PREFIX, TUNGA_URL
+from tunga.settings import TUNGA_URL
 from tunga_activity import verbs
 from tunga_activity.models import ActivityReadLog
 from tunga_settings.slugs import TASK_ACTIVITY_UPDATE_EMAIL
@@ -98,7 +98,7 @@ class Command(BaseCommand):
             task = user_task.content_object
 
             to = [user_task.user.email]
-            subject = "%s New activity for task: %s" % (EMAIL_SUBJECT_PREFIX, task.summary)
+            subject = "New activity for task: {}".format(task.summary)
             ctx = {
                 'receiver': user_task.user,
                 'new_activity': user_task.new_activity,
@@ -106,6 +106,8 @@ class Command(BaseCommand):
                 'task_url': '%s/task/%s/' % (TUNGA_URL, user_task.object_id)
             }
 
-            if send_mail(subject, 'tunga/email/email_unread_task_activity', to, ctx):
+            if send_mail(
+                    subject, 'tunga/email/unread_task_activity', to, ctx, **dict(deal_ids=[task.hubspot_deal_id])
+            ):
                 user_task.last_email_at = datetime.datetime.utcnow()
                 user_task.save()

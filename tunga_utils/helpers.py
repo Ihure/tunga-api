@@ -1,13 +1,15 @@
-import re
 import json
+import re
 from decimal import Decimal
 
 from allauth.socialaccount.models import SocialToken
 from django.apps import apps as django_apps
 from django.core.exceptions import ImproperlyConfigured
 from django.http import HttpResponseRedirect
-from django.template.defaultfilters import urlizetrunc, safe
-from django.utils.html import strip_tags
+from django.template.defaultfilters import urlizetrunc, safe, striptags
+from django.utils import six
+
+from tunga_utils.constants import HEADER_EDIT_TOKEN
 
 
 def get_tunga_model(model):
@@ -54,7 +56,7 @@ class Echo(object):
 
 class GenericObject:
     def __init__(self, **kwargs):
-        for k, v in kwargs.iteritems():
+        for k, v in six.iteritems(kwargs):
             setattr(self, k, v)
 
 
@@ -66,10 +68,27 @@ def get_social_token(user, provider):
 
 
 def convert_to_text(body):
-    return strip_tags(re.sub(r'<br\s*/>', '\n', body, flags=re.IGNORECASE))
+    """
+    Create plain text from html
+    :param body:
+    :return:
+    """
+    if not body:
+        return body
+    txt_body = re.sub(r'(<br\s*/\s*>|<\s*/\s*(?:div|p)>)', '\\1\n', body, flags=re.IGNORECASE)
+    txt_body = striptags(txt_body)  # Striptags
+    txt_body = re.sub(r'&nbsp;', ' ', txt_body, flags=re.IGNORECASE)  # Replace &nbsp; with space
+    txt_body = re.sub(r' {2,}', ' ', txt_body, flags=re.IGNORECASE)  # Squash all multi spaces
+    txt_body = re.sub(r'\r\n', '\n', txt_body, flags=re.IGNORECASE)  # single new line format
+    txt_body = re.sub(r'\t', '\n', txt_body, flags=re.IGNORECASE)  # Remove indents
+    txt_body = re.sub(r'\n( )+', '\n', txt_body, flags=re.IGNORECASE)  # Remove indents
+    txt_body = re.sub(r'\n{3,}', '\n\n', txt_body, flags=re.IGNORECASE)  # Limit consecutive new lines to a max of 2
+    return txt_body
 
 
 def convert_to_html(body):
+    if not body:
+        return body
     return safe(
         re.sub(
             r'<a([^>]+)>(?:http|ftp)s?://([^<]+)</a>',
@@ -118,3 +137,7 @@ def clean_meta_value(meta_value):
         except:
             pass
     return str(meta_value)
+
+
+def get_edit_token_header(request):
+    return request.META.get(HEADER_EDIT_TOKEN, None)

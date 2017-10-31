@@ -1,9 +1,11 @@
+# -*- coding: utf-8 -*-
+
 from __future__ import unicode_literals
 
 from django.contrib.auth.models import AbstractUser
 from django.contrib.auth.tokens import default_token_generator
 from django.db import models
-from django.utils.encoding import force_bytes
+from django.utils.encoding import force_bytes, python_2_unicode_compatible
 from django.utils.http import urlsafe_base64_encode
 from dry_rest_permissions.generics import allow_staff_or_superuser
 
@@ -40,6 +42,9 @@ class TungaUser(AbstractUser):
         if self.type == USER_TYPE_PROJECT_OWNER:
             self.pending = False
         super(TungaUser, self).save(*args, **kwargs)
+
+    def __str__(self):
+        return '{} ({})'.format(self.display_name, self.get_username())
 
     @staticmethod
     @allow_staff_or_superuser
@@ -151,14 +156,21 @@ class TungaUser(AbstractUser):
     def generate_reset_token(self):
         return default_token_generator.make_token(self)
 
+    @property
+    def tax_rate(self):
+        if self.profile and self.profile.country and self.profile.country.code == 'NL':
+            return 21
+        return 0
 
+
+@python_2_unicode_compatible
 class EmailVisitor(models.Model):
     email = models.EmailField(unique=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     last_login_at = models.DateTimeField(auto_now=True)
 
-    def __unicode__(self):
+    def __str__(self):
         return self.email
 
     class Meta:

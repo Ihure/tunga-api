@@ -1,25 +1,29 @@
+# -*- coding: utf-8 -*-
+
 import datetime
+from copy import copy
 from decimal import Decimal
 
 from allauth.account.signals import user_signed_up
 from django.contrib.auth import get_user_model
 from django.contrib.contenttypes.models import ContentType
 from django.core.validators import MinValueValidator
-from django.db.models.query_utils import Q
 from django.template.defaultfilters import floatformat
 from rest_framework import serializers
 from rest_framework.exceptions import ValidationError
 
-from tunga.settings import TUNGA_SHARE_PERCENTAGE
 from tunga_auth.serializers import UserSerializer
 from tunga_profiles.utils import profile_check
 from tunga_tasks import slugs
 from tunga_tasks.models import Task, Application, Participation, TimeEntry, ProgressEvent, ProgressReport, \
     Project, IntegrationMeta, Integration, IntegrationEvent, IntegrationActivity, TASK_PAYMENT_METHOD_CHOICES, \
-    TaskInvoice, Estimate, Quote, WorkActivity, WorkPlan, AbstractEstimate
-from tunga_tasks.notifications import notify_new_task
+    Estimate, Quote, WorkActivity, WorkPlan, AbstractEstimate, TaskPayment, ParticipantPayment, \
+    MultiTaskPaymentKey, TaskAccess, SkillsApproval, Sprint
 from tunga_tasks.signals import application_response, participation_response, task_applications_closed, task_closed, \
-    task_integration, estimate_created, estimate_status_changed, quote_status_changed, quote_created, task_approved
+    task_integration, estimate_created, estimate_status_changed, quote_status_changed, quote_created, task_approved, \
+    task_call_window_scheduled, task_fully_saved, task_details_completed, task_owner_added, task_payment_approved
+from tunga_tasks.tasks import update_multi_tasks
+from tunga_utils import coinbase_utils, bitcoin_utils
 from tunga_utils.constants import PROGRESS_EVENT_TYPE_MILESTONE, USER_TYPE_PROJECT_OWNER, USER_SOURCE_TASK_WIZARD, \
     TASK_SCOPE_ONGOING, VISIBILITY_CUSTOM, TASK_SCOPE_TASK, TASK_SCOPE_PROJECT, TASK_SOURCE_NEW_USER, STATUS_INITIAL, \
     STATUS_ACCEPTED, STATUS_APPROVED, STATUS_DECLINED, STATUS_REJECTED, STATUS_SUBMITTED
@@ -28,7 +32,7 @@ from tunga_utils.mixins import GetCurrentUserAnnotatedSerializerMixin
 from tunga_utils.models import Rating
 from tunga_utils.serializers import ContentTypeAnnotatedModelSerializer, SkillSerializer, \
     CreateOnlyCurrentUserDefault, SimpleUserSerializer, UploadSerializer, DetailAnnotatedModelSerializer, \
-    SimpleRatingSerializer, InvoiceUserSerializer
+    SimpleRatingSerializer, InvoiceUserSerializer, TaskInvoiceSerializer
 
 
 class SimpleProjectSerializer(ContentTypeAnnotatedModelSerializer):
@@ -45,8 +49,13 @@ class SimpleTaskSerializer(ContentTypeAnnotatedModelSerializer):
     class Meta:
         model = Task
         fields = (
-            'id', 'user', 'title', 'summary', 'currency', 'fee', 'bid', 'pay', 'closed', 'paid', 'display_fee',
-            'type', 'scope', 'is_project', 'is_task'
+            'id', 'user', 'title', 'summary', 'currency', 'fee', 'bid', 'pay', 'display_fee',
+            'type', 'scope', 'is_project', 'is_task', 'update_schedule_display',
+            'approved', 'review', 'apply', 'processing', 'closed', 'paid', 'btc_paid', 'pay_distributed', 'archived',
+            'is_payable', 'is_developer_ready', 'requires_estimate', 'payment_status',
+            'can_pay_distribution_btc', 'started_at', 'started', 'analytics_id',
+            'approved_at', 'deadline', 'apply_closed_at', 'closed_at', 'processing_at', 'paid_at', 'btc_paid_at',
+            'archived_at', 'created_at', 'invoice_date', 'schedule_call_start', 'schedule_call_end'
         )
 
 
@@ -63,13 +72,17 @@ class SimpleParticipationSerializer(ContentTypeAnnotatedModelSerializer):
 
     class Meta:
         model = Participation
-        exclude = ('created_at',)
+        exclude = ('created_at', 'user')
 
 
 class NestedWorkActivitySerializer(serializers.ModelSerializer):
     user = SimpleUserSerializer(
         required=False, read_only=True, default=CreateOnlyCurrentUserDefault()
     )
+    assignee = SimpleUserSerializer(
+        required=False, read_only=True
+    )
+    assignee_id = serializers.IntegerField(required=False, write_only=True)
 
     class Meta:
         model = WorkActivity
@@ -95,7 +108,7 @@ class SimpleAbstractEstimateSerializer(ContentTypeAnnotatedModelSerializer):
     class Meta:
         model = AbstractEstimate
         fields = (
-            'id', 'user', 'task', 'status', 'introduction', 'activities',
+            'id', 'user', 'task', 'status', 'title', 'introduction', 'activities', 'start_date', 'end_date',
             'moderated_by', 'moderator_comment', 'moderated_at', 'reviewed_by', 'reviewer_comment', 'reviewed_at'
         )
 
@@ -116,6 +129,12 @@ class SimpleQuoteSerializer(SimpleAbstractEstimateSerializer):
         )
 
 
+class SimpleSprintSerializer(SimpleAbstractEstimateSerializer):
+
+    class Meta(SimpleAbstractEstimateSerializer.Meta):
+        model = Sprint
+
+
 class BasicProgressEventSerializer(ContentTypeAnnotatedModelSerializer):
     created_by = SimpleUserSerializer()
 
@@ -127,6 +146,7 @@ class BasicProgressEventSerializer(ContentTypeAnnotatedModelSerializer):
 class BasicProgressReportSerializer(ContentTypeAnnotatedModelSerializer):
     user = SimpleUserSerializer()
     status_display = serializers.CharField(required=False, read_only=True, source='get_status_display')
+    stuck_reason_display = serializers.CharField(required=False, read_only=True, source='get_stuck_reason_display')
 
     class Meta:
         model = ProgressReport
@@ -135,9 +155,11 @@ class BasicProgressReportSerializer(ContentTypeAnnotatedModelSerializer):
 
 class SimpleProgressEventSerializer(BasicProgressEventSerializer):
     report = BasicProgressReportSerializer(read_only=True, required=False, source='progressreport')
+    status = serializers.CharField(read_only=True, required=False)
 
     class Meta(BasicProgressEventSerializer.Meta):
         model = ProgressEvent
+        fields = '__all__'
 
 
 class SimpleProgressReportSerializer(BasicProgressReportSerializer):
@@ -145,6 +167,7 @@ class SimpleProgressReportSerializer(BasicProgressReportSerializer):
 
     class Meta(BasicProgressReportSerializer.Meta):
         model = ProgressReport
+        fields = '__all__'
 
 
 class NestedTaskParticipationSerializer(ContentTypeAnnotatedModelSerializer):
@@ -157,6 +180,15 @@ class NestedTaskParticipationSerializer(ContentTypeAnnotatedModelSerializer):
         exclude = ('task', 'created_at')
 
 
+class ParticipantUpdatesSerializer(serializers.Serializer):
+    id = serializers.IntegerField(required=True)
+    enabled = serializers.BooleanField(required=True)
+
+    class Meta:
+        model = Participation
+        fields = ('id', 'enabled')
+
+
 class NestedProgressEventSerializer(ContentTypeAnnotatedModelSerializer):
     created_by = SimpleUserSerializer(
         required=False, read_only=True, default=CreateOnlyCurrentUserDefault()
@@ -166,6 +198,14 @@ class NestedProgressEventSerializer(ContentTypeAnnotatedModelSerializer):
     class Meta:
         model = ProgressEvent
         exclude = ('task', 'created_at')
+
+
+class SimpleTaskAccessSerializer(ContentTypeAnnotatedModelSerializer):
+    user = SimpleUserSerializer()
+
+    class Meta:
+        model = TaskAccess
+        fields = ('user',)
 
 
 class ProjectDetailsSerializer(ContentTypeAnnotatedModelSerializer):
@@ -190,32 +230,11 @@ class ProjectSerializer(ContentTypeAnnotatedModelSerializer, DetailAnnotatedMode
         details_serializer = ProjectDetailsSerializer
 
 
-class TaskPaymentSerializer(serializers.Serializer):
+class TaskPaySerializer(serializers.Serializer):
     user = InvoiceUserSerializer(required=False, read_only=True)
     payment_method = serializers.ChoiceField(choices=TASK_PAYMENT_METHOD_CHOICES, required=True)
     fee = serializers.DecimalField(max_digits=19, decimal_places=4)
-
-
-class TaskInvoiceSerializer(serializers.ModelSerializer, GetCurrentUserAnnotatedSerializerMixin):
-    client = InvoiceUserSerializer(required=False, read_only=True)
-    developer = InvoiceUserSerializer(required=False, read_only=True)
-    amount = serializers.JSONField(required=False, read_only=True)
-    developer_amount = serializers.SerializerMethodField(required=False, read_only=True)
-
-    class Meta:
-        model = TaskInvoice
-        fields = '__all__'
-
-    def get_developer_amount(self, obj):
-        current_user = self.get_current_user()
-        if current_user and current_user.is_developer:
-            try:
-                participation = obj.task.participation_set.get(user=current_user)
-                share = obj.task.get_user_participation_share(participation.id)
-                return obj.get_amount_details(share=share)
-            except:
-                pass
-        return obj.get_amount_details(share=0)
+    withhold_tunga_fee = serializers.BooleanField(required=False, default=False)
 
 
 class ParticipantShareSerializer(serializers.Serializer):
@@ -236,12 +255,22 @@ class TaskDetailsSerializer(ContentTypeAnnotatedModelSerializer):
     parent = SimpleTaskSerializer()
     skills = SkillSerializer(many=True)
     applications = SimpleApplicationSerializer(many=True, source='application_set')
-    participation = SimpleParticipationSerializer(many=True, source='participation_set')
+    participation = SimpleParticipationSerializer(many=True)
     participation_shares = ParticipantShareSerializer(many=True, source='get_participation_shares')
+    active_participation = SimpleParticipationSerializer(many=True)
+    active_participants = SimpleUserSerializer(many=True)
+    owner = SimpleUserSerializer()
+    pm = SimpleUserSerializer()
+    admins = SimpleUserSerializer(many=True)
 
     class Meta:
         model = Task
-        fields = ('project', 'is_project', 'parent', 'amount', 'skills', 'applications', 'participation', 'participation_shares')
+        fields = (
+            'project', 'is_project', 'parent',
+            'amount', 'skills', 'applications',
+            'participation', 'participation_shares', 'active_participation', 'active_participants',
+            'owner', 'pm', 'admins'
+        )
 
 
 class TaskSerializer(ContentTypeAnnotatedModelSerializer, DetailAnnotatedModelSerializer,
@@ -260,6 +289,7 @@ class TaskSerializer(ContentTypeAnnotatedModelSerializer, DetailAnnotatedModelSe
         required=False, error_messages={'blank': 'Please specify the skills required for this task'}
     )
     payment_status = serializers.CharField(required=False, read_only=True)
+    can_pay_distribution_btc = serializers.CharField(required=False, read_only=True)
     deadline = serializers.DateTimeField(required=False, allow_null=True)
     can_apply = serializers.SerializerMethodField(read_only=True, required=False)
     can_claim = serializers.SerializerMethodField(read_only=True, required=False)
@@ -275,6 +305,7 @@ class TaskSerializer(ContentTypeAnnotatedModelSerializer, DetailAnnotatedModelSe
     )
     update_schedule_display = serializers.CharField(required=False, read_only=True)
     participation = NestedTaskParticipationSerializer(required=False, read_only=False, many=True)
+    participant_updates = ParticipantUpdatesSerializer(required=False, read_only=False, many=True)
     milestones = NestedProgressEventSerializer(required=False, read_only=False, many=True)
     progress_events = NestedProgressEventSerializer(required=False, read_only=True, many=True)
     ratings = SimpleRatingSerializer(required=False, read_only=False, many=True)
@@ -283,7 +314,12 @@ class TaskSerializer(ContentTypeAnnotatedModelSerializer, DetailAnnotatedModelSe
     invoice = TaskInvoiceSerializer(required=False, read_only=True)
     estimate = SimpleEstimateSerializer(required=False, read_only=True)
     quote = SimpleQuoteSerializer(required=False, read_only=True)
-    pm = SimpleUserSerializer(required=False, read_only=True)
+    sprints = SimpleSprintSerializer(required=False, read_only=True, many=True)
+    tunga_ratio_dev = serializers.DecimalField(max_digits=19, decimal_places=4, required=False, read_only=True)
+    tunga_ratio_pm = serializers.DecimalField(max_digits=19, decimal_places=4, required=False, read_only=True)
+    tax_ratio = serializers.DecimalField(max_digits=19, decimal_places=4, required=False, read_only=True)
+    started_at = serializers.DateTimeField(required=False, read_only=True)
+    started = serializers.BooleanField(required=False, read_only=True)
 
     class Meta:
         model = Task
@@ -304,6 +340,7 @@ class TaskSerializer(ContentTypeAnnotatedModelSerializer, DetailAnnotatedModelSe
         has_requirements = attrs.get('is_project', None) or (self.instance and self.instance.has_requirements)
         coders_needed = attrs.get('coders_needed', None)
         pm_required = attrs.get('pm_required', None)
+        call_required = attrs.get('call_required', None)
 
         fee = attrs.get('fee', None)
         title = attrs.get('title', None)
@@ -314,6 +351,9 @@ class TaskSerializer(ContentTypeAnnotatedModelSerializer, DetailAnnotatedModelSe
         email = self.initial_data.get('email', None)
         first_name = self.initial_data.get('first_name', None)
         last_name = self.initial_data.get('last_name', None)
+
+        schedule_call_start = attrs.get('schedule_call_start', None)
+        schedule_call_end = attrs.get('schedule_call_end', None)
 
         current_user = self.get_current_user()
 
@@ -346,30 +386,24 @@ class TaskSerializer(ContentTypeAnnotatedModelSerializer, DetailAnnotatedModelSe
                     errors.update({'title': 'This field is required.'})
                 if not skills and not self.partial:
                     errors.update({'skills': 'This field is required.'})
-                if not pm_required and not self.partial:
+                if pm_required is None and not self.partial:
                     errors.update({'pm_required': 'This field is required.'})
         else:
-            if not description:
-                errors.update({'description': 'This field is required.'})
-            if email:
-                try:
-                    get_user_model().objects.get(email=email)
-                    errors.update({
-                        'form': 'Looks like you already have a Tunga account. Please login to create new tasks.',
-                        'email': 'This email address is already attached to an account on Tunga'
-                    })
-                except get_user_model().DoesNotExist:
-                    pass
-            else:
-                errors.update({'email': 'This field is required.'})
-            if not first_name:
-                errors.update({'first_name': 'This field is required.'})
-            if not last_name:
-                errors.update({'last_name': 'This field is required.'})
+            if not self.instance:
+                if not email:
+                    errors.update({'email': 'This field is required.'})
+                if not first_name:
+                    errors.update({'first_name': 'This field is required.'})
+                if not last_name:
+                    errors.update({'last_name': 'This field is required.'})
+            if self.instance and call_required:
+                if not schedule_call_start:
+                    errors.update({'schedule_call_start': 'Please select a day and start time.'})
+                if not schedule_call_end:
+                    errors.update({'schedule_call_end': 'Please select a day and end time.'})
 
         if errors:
             raise ValidationError(errors)
-
         return attrs
 
     def save_task(self, validated_data, instance=None):
@@ -386,6 +420,7 @@ class TaskSerializer(ContentTypeAnnotatedModelSerializer, DetailAnnotatedModelSe
         participation = None
         milestones = None
         participants = None
+        participant_updates = None
         ratings = None
         if 'skills' in validated_data:
             skills = validated_data.pop('skills')
@@ -395,12 +430,19 @@ class TaskSerializer(ContentTypeAnnotatedModelSerializer, DetailAnnotatedModelSe
             milestones = validated_data.pop('milestones')
         if 'participants' in validated_data:
             participants = validated_data.pop('participants')
+        if 'participant_updates' in validated_data:
+            participant_updates = validated_data.pop('participant_updates')
         if 'ratings' in validated_data:
             ratings = validated_data.pop('ratings')
 
         initial_apply = True
         initial_closed = False
         initial_approved = False
+        initial_schedule_call_start = None
+        initial_description = None
+        initial_owner = None
+        initial_payment_approved = False
+
         new_user = None
         is_update = bool(instance)
 
@@ -408,6 +450,10 @@ class TaskSerializer(ContentTypeAnnotatedModelSerializer, DetailAnnotatedModelSe
             initial_apply = instance.apply
             initial_closed = instance.closed
             initial_approved = instance.approved
+            initial_schedule_call_start = instance.schedule_call_start
+            initial_description = instance.description
+            initial_owner = instance.owner
+            initial_payment_approved = instance.payment_approved
 
             if not instance.closed and validated_data.get('closed'):
                 validated_data['closed_at'] = datetime.datetime.utcnow()
@@ -429,36 +475,65 @@ class TaskSerializer(ContentTypeAnnotatedModelSerializer, DetailAnnotatedModelSe
                 first_name = self.initial_data.get('first_name', None)
                 last_name = self.initial_data.get('last_name', None)
 
-                new_user = get_user_model().objects.create_user(
-                    username=email, email=email, password=get_user_model().objects.make_random_password(),
-                    first_name=first_name, last_name=last_name,
-                    type=USER_TYPE_PROJECT_OWNER, source=USER_SOURCE_TASK_WIZARD
-                )
+                new_user = None
+                is_new_user = False
+                if email:
+                    try:
+                        new_user = get_user_model().objects.get(email=email)
+                        is_new_user = False
+                    except get_user_model().DoesNotExist:
+                        new_user = get_user_model().objects.create_user(
+                            username=email, email=email, password=get_user_model().objects.make_random_password(),
+                            first_name=first_name, last_name=last_name,
+                            type=USER_TYPE_PROJECT_OWNER, source=USER_SOURCE_TASK_WIZARD
+                        )
+                        is_new_user = True
+
                 if new_user:
                     validated_data.update({'user': new_user})
-                    user_signed_up.send(sender=get_user_model(), request=None, user=new_user)
+                    if is_new_user:
+                        user_signed_up.send(sender=get_user_model(), request=None, user=new_user)
 
             instance = super(TaskSerializer, self).create(validated_data)
 
         self.save_skills(instance, skills)
-        self.save_participants(instance, participants)
         self.save_participation(instance, participation)
         self.save_milestones(instance, milestones)
+        self.save_participants(instance, participants)
+        self.save_participant_updates(participant_updates)
         self.save_ratings(instance, ratings)
 
         if is_update:
             if not initial_approved and instance.approved:
+                instance.approved_at = datetime.datetime.utcnow()
+                instance.save()
                 task_approved.send(sender=Task, task=instance)
+
+            if not initial_owner and instance.owner:
+                instance.save()
+                task_owner_added.send(sender=Task, task=instance)
+
+            if not (current_user and current_user.is_authenticated()):
+                if instance.schedule_call_start and not initial_schedule_call_start:
+                    task_call_window_scheduled.send(sender=Task, task=instance)
+
+                if instance.description and not initial_description:
+                    task_details_completed.send(sender=Task, task=instance)
 
             if initial_apply and not instance.apply:
                 task_applications_closed.send(sender=Task, task=instance)
 
             if not initial_closed and instance.closed:
                 task_closed.send(sender=Task, task=instance)
+
+            if not initial_payment_approved and instance.payment_approved:
+                instance.payment_approved_at = datetime.datetime.utcnow()
+                instance.payment_approved_by = current_user
+                instance.save()
+                task_payment_approved.send(sender=Task, task=instance)
         else:
-            # Triggered here instead of in the post_save signal to allow skills to be attached first
-            # TODO: Consider moving this trigger
-            notify_new_task.delay(instance.id, new_user=bool(new_user))
+            # Triggered here instead of in the post_save signal to allow task to be fully saved
+            task_fully_saved.send(sender=Task, task=instance, new_user=not (current_user and current_user.is_authenticated()))
         return instance
 
     def create(self, validated_data):
@@ -476,7 +551,7 @@ class TaskSerializer(ContentTypeAnnotatedModelSerializer, DetailAnnotatedModelSe
         if participation:
             new_assignee = None
             for item in participation:
-                if 'accepted' in item and item.get('accepted', False):
+                if 'status' in item and item.get('status', None) == STATUS_ACCEPTED:
                     item['activated_at'] = datetime.datetime.utcnow()
                 defaults = item
                 if isinstance(defaults, dict):
@@ -489,7 +564,7 @@ class TaskSerializer(ContentTypeAnnotatedModelSerializer, DetailAnnotatedModelSe
                 try:
                     participation_obj, created = Participation.objects.update_or_create(
                         task=task, user=item['user'], defaults=defaults)
-                    if (not created) and 'accepted' in item:
+                    if (not created) and 'status' in item and item.get('status', None) != STATUS_INITIAL:
                         participation_response.send(sender=Participation, participation=participation_obj)
                     if 'assignee' in item and item['assignee']:
                         new_assignee = item['user']
@@ -497,6 +572,18 @@ class TaskSerializer(ContentTypeAnnotatedModelSerializer, DetailAnnotatedModelSe
                     pass
             if new_assignee:
                 Participation.objects.exclude(user=new_assignee).filter(task=task).update(assignee=False)
+
+    def save_participant_updates(self, participant_updates):
+        if participant_updates:
+            for item in participant_updates:
+                participation_id = item.get('id', None)
+                enabled = item.get('enabled', None)
+
+                if participation_id and enabled is not None:
+                    try:
+                        Participation.objects.filter(id=participation_id).update(updates_enabled=enabled)
+                    except:
+                        pass
 
     def save_milestones(self, task, milestones):
         if milestones:
@@ -514,11 +601,14 @@ class TaskSerializer(ContentTypeAnnotatedModelSerializer, DetailAnnotatedModelSe
                     pass
 
     def save_ratings(self, task, ratings):
+        current_user = self.get_current_user()
         if ratings:
             for item in ratings:
                 try:
+                    defaults = copy(item)
+                    defaults['created_by'] = current_user or task.user
                     Rating.objects.update_or_create(content_type=ContentType.objects.get_for_model(task),
-                                                    object_id=task.id, criteria=item['criteria'], defaults=item)
+                                                    object_id=task.id, criteria=item['criteria'], defaults=defaults)
                 except:
                     pass
 
@@ -537,11 +627,9 @@ class TaskSerializer(ContentTypeAnnotatedModelSerializer, DetailAnnotatedModelSe
                     if assignee:
                         defaults['assignee'] = bool(user.id == assignee)
                     if rejected_participants and user.id in rejected_participants:
-                        defaults['accepted'] = False
-                        defaults['responded'] = True
+                        defaults['status'] = STATUS_REJECTED
                     if confirmed_participants and user.id in confirmed_participants:
-                        defaults['accepted'] = True
-                        defaults['responded'] = True
+                        defaults['status'] = STATUS_ACCEPTED
                         defaults['activated_at'] = datetime.datetime.utcnow()
 
                     participation_obj, created = Participation.objects.update_or_create(
@@ -561,7 +649,7 @@ class TaskSerializer(ContentTypeAnnotatedModelSerializer, DetailAnnotatedModelSe
         if not obj.pay:
             return None
         if user and user.is_developer:
-            amount = obj.pay_dev * (1 - obj.tunga_ratio_dev)
+            amount = Decimal(obj.pay_dev) * Decimal(1 - obj.tunga_ratio_dev)
         return obj.display_fee(amount=amount)
 
     def get_can_apply(self, obj):
@@ -597,7 +685,7 @@ class TaskSerializer(ContentTypeAnnotatedModelSerializer, DetailAnnotatedModelSe
     def get_is_participant(self, obj):
         user = self.get_current_user()
         if user:
-            return obj.subtask_participants_inclusive_filter.filter((Q(accepted=True) | Q(responded=False)), user=user).count() > 0
+            return obj.get_is_participant(user, active_only=False)
         return False
 
     def get_is_admin(self, obj):
@@ -613,12 +701,69 @@ class TaskSerializer(ContentTypeAnnotatedModelSerializer, DetailAnnotatedModelSe
                     'id': participation.id,
                     'user': participation.user.id,
                     'assignee': participation.assignee,
-                    'accepted': participation.accepted,
-                    'responded': participation.responded
+                    'status': participation.status
                 }
             except:
                 pass
         return None
+
+
+class MultiTaskPaymentKeyDetailsSerializer(ContentTypeAnnotatedModelSerializer):
+    tasks = SimpleTaskSerializer(many=True)
+    distribute_tasks = SimpleTaskSerializer(many=True)
+
+    class Meta:
+        model = MultiTaskPaymentKey
+        fields = ('tasks', 'distribute_tasks')
+
+
+class MultiTaskPaymentKeySerializer(ContentTypeAnnotatedModelSerializer, DetailAnnotatedModelSerializer):
+    user = SimpleUserSerializer(required=False, read_only=True, default=CreateOnlyCurrentUserDefault())
+    tasks = serializers.PrimaryKeyRelatedField(
+        many=True, queryset=Task.objects.all(), required=False
+    )
+    distribute_tasks = serializers.PrimaryKeyRelatedField(
+        many=True, queryset=Task.objects.all(), required=False
+    )
+    amount = serializers.DecimalField(max_digits=19, decimal_places=4, required=False, read_only=True)
+    pay = serializers.DecimalField(max_digits=19, decimal_places=4, required=False, read_only=True)
+    pay_participants = serializers.DecimalField(max_digits=19, decimal_places=4, required=False, read_only=True)
+    tax_ratio = serializers.DecimalField(max_digits=19, decimal_places=4, required=False, read_only=True)
+
+    class Meta:
+        model = MultiTaskPaymentKey
+        read_only_fields = (
+            'created_at', 'paid', 'paid_at', 'btc_address', 'btc_price'
+        )
+        fields = '__all__'
+        details_serializer = MultiTaskPaymentKeyDetailsSerializer
+
+    def save_bulk_payment(self, validated_data, instance=None):
+        initial_payment_method = None
+        if instance:
+            initial_payment_method = instance.payment_method
+            instance = super(MultiTaskPaymentKeySerializer, self).update(instance, validated_data)
+        else:
+            instance = super(MultiTaskPaymentKeySerializer, self).create(validated_data)
+
+        if not instance.btc_address or not bitcoin_utils.is_valid_btc_address(instance.btc_address):
+            btc_price = coinbase_utils.get_btc_price(instance.currency)
+            instance.btc_price = btc_price
+
+            address = coinbase_utils.get_new_address(coinbase_utils.get_api_client())
+            instance.btc_address = address
+            instance.save()
+
+        if instance.payment_method != initial_payment_method:
+            update_multi_tasks.delay(instance.id, distribute=False)
+
+        return instance
+
+    def create(self, validated_data):
+        return self.save_bulk_payment(validated_data)
+
+    def update(self, instance, validated_data):
+        return self.save_bulk_payment(validated_data, instance=instance)
 
 
 class ApplicationDetailsSerializer(SimpleApplicationSerializer):
@@ -641,15 +786,15 @@ class ApplicationSerializer(ContentTypeAnnotatedModelSerializer, DetailAnnotated
             'pitch': {'required': True, 'allow_blank': False, 'allow_null': False},
             'hours_needed': {'required': True, 'allow_null': False},
             #'hours_available': {'required': True, 'allow_null': False},
-            'deliver_at': {'required': True, 'allow_null': False}
+            'deliver_at': {'required': True, 'allow_null': False},
+            'update_interval':  {'required': False, 'allow_blank': True, 'allow_null': True},
+            'update_interval_units': {'required': False, 'allow_blank': True, 'allow_null': True}
         }
 
     def update(self, instance, validated_data):
-        initial_responded = instance.responded
-        if validated_data.get('accepted'):
-            validated_data['responded'] = True
+        initial_status = instance.status
         instance = super(ApplicationSerializer, self).update(instance, validated_data)
-        if not initial_responded and instance.accepted or instance.responded:
+        if instance.status != STATUS_INITIAL and instance.status != initial_status:
             application_response.send(sender=Application, application=instance)
         return instance
 
@@ -673,12 +818,11 @@ class ParticipationSerializer(ContentTypeAnnotatedModelSerializer, DetailAnnotat
         details_serializer = ParticipationDetailsSerializer
 
     def update(self, instance, validated_data):
-        initial_responded = instance.responded
-        if validated_data.get('accepted'):
-            validated_data['responded'] = True
+        initial_status = instance.status
+        if validated_data.get('status', None) == STATUS_ACCEPTED:
             validated_data['activated_at'] = datetime.datetime.utcnow()
         instance = super(ParticipationSerializer, self).update(instance, validated_data)
-        if not initial_responded and instance.accepted or instance.responded:
+        if instance.status != STATUS_INITIAL and instance.status != initial_status:
             participation_response.send(sender=Participation, participation=instance)
         return instance
 
@@ -691,7 +835,11 @@ class AbstractEstimateDetailsSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Estimate
-        fields = ('user', 'task', 'moderated_by', 'reviewed_by')
+        fields = (
+            'user', 'task', 'moderated_by', 'reviewed_by',
+            'dev_hours', 'pm_hours', 'hours',
+            'dev_fee', 'pm_fee', 'fee'
+        )
 
 
 class AbstractEstimateSerializer(
@@ -785,6 +933,7 @@ class AbstractEstimateSerializer(
                     item['content_type'] = c_type
                     item['object_id'] = instance.id
                     item['user'] = self.get_current_user()
+                    item['assignee_id'] = item.get('assignee_id', None)
                     WorkActivity.objects.create(**item)
                 except:
                     pass
@@ -844,6 +993,18 @@ class QuoteSerializer(AbstractEstimateSerializer):
                     pass
 
 
+class SprintSerializer(AbstractEstimateSerializer):
+
+    class Meta(AbstractEstimateSerializer.Meta):
+        model = Sprint
+
+    #def on_create_complete(self, instance):
+    #    estimate_created.send(sender=self.Meta.model, estimate=instance)
+
+    #def on_status_change(self, instance):
+    #    estimate_status_changed.send(sender=self.Meta.model, estimate=instance)
+
+
 class TimeEntryDetailsSerializer(serializers.ModelSerializer):
     user = SimpleUserSerializer()
     task = SimpleTaskSerializer()
@@ -866,23 +1027,43 @@ class TimeEntrySerializer(ContentTypeAnnotatedModelSerializer, DetailAnnotatedMo
 class ProgressEventDetailsSerializer(serializers.ModelSerializer):
     task = SimpleTaskSerializer()
     created_by = SimpleUserSerializer()
+    participants = SimpleUserSerializer(many=True)
     active_participants = SimpleParticipationSerializer(many=True, source='task.active_participants')
 
     class Meta:
         model = ProgressEvent
-        fields = ('task', 'created_by', 'active_participants')
+        fields = ('task', 'created_by', 'participants', 'active_participants')
 
 
-class ProgressEventSerializer(ContentTypeAnnotatedModelSerializer, DetailAnnotatedModelSerializer):
+class ProgressEventSerializer(
+    ContentTypeAnnotatedModelSerializer, DetailAnnotatedModelSerializer, GetCurrentUserAnnotatedSerializerMixin
+):
     created_by = SimpleUserSerializer(required=False, read_only=True,
                                                     default=CreateOnlyCurrentUserDefault())
-    report = SimpleProgressReportSerializer(read_only=True, required=False, source='progressreport')
+    reports = SimpleProgressReportSerializer(read_only=True, required=False, source='progressreport_set', many=True)
+    my_report = serializers.SerializerMethodField(read_only=True, required=False)
+    is_participant = serializers.SerializerMethodField(read_only=True, required=False)
+    status = serializers.CharField(read_only=True, required=False)
 
     class Meta:
         model = ProgressEvent
         exclude = ()
         read_only_fields = ('created_at',)
         details_serializer = ProgressEventDetailsSerializer
+
+    def get_my_report(self, obj):
+        user = self.get_current_user()
+        if user:
+            my_report = obj.user_report(user)
+            if my_report:
+                return SimpleProgressReportSerializer(instance=my_report).data
+        return None
+
+    def get_is_participant(self, obj):
+        user = self.get_current_user()
+        if user:
+            return obj.get_is_participant(user, active_only=True)
+        return False
 
 
 class ProgressReportDetailsSerializer(serializers.ModelSerializer):
@@ -896,6 +1077,7 @@ class ProgressReportDetailsSerializer(serializers.ModelSerializer):
 class ProgressReportSerializer(ContentTypeAnnotatedModelSerializer, DetailAnnotatedModelSerializer):
     user = SimpleUserSerializer(required=False, read_only=True, default=CreateOnlyCurrentUserDefault())
     status_display = serializers.CharField(required=False, read_only=True, source='get_status_display')
+    stuck_reason_display = serializers.CharField(required=False, read_only=True, source='get_stuck_reason_display')
     uploads = UploadSerializer(required=False, read_only=True, many=True)
 
     class Meta:
@@ -1056,3 +1238,54 @@ class SimpleIntegrationActivitySerializer(ContentTypeAnnotatedModelSerializer):
             }
             return 'commented on %s' % msg_map[event_name]
         return None
+
+
+class TaskPaymentDetailsSerializer(ContentTypeAnnotatedModelSerializer):
+    task = SimpleTaskSerializer()
+
+    class Meta:
+        model = TaskPayment
+        fields = ('task',)
+
+
+class TaskPaymentSerializer(ContentTypeAnnotatedModelSerializer, DetailAnnotatedModelSerializer):
+
+    class Meta:
+        model = TaskPayment
+        fields = '__all__'
+        details_serializer = TaskPaymentDetailsSerializer
+
+
+class ParticipantPaymentDetailsSerializer(ContentTypeAnnotatedModelSerializer):
+    source = TaskPaymentSerializer()
+    participant = SimpleParticipationSerializer()
+
+    class Meta:
+        model = ParticipantPayment
+        fields = ('source', 'participant')
+
+
+class ParticipantPaymentSerializer(ContentTypeAnnotatedModelSerializer, DetailAnnotatedModelSerializer):
+
+    class Meta:
+        model = ParticipantPayment
+        fields = '__all__'
+        details_serializer = ParticipantPaymentDetailsSerializer
+
+
+class SkillsApprovalDetailsSerializer(serializers.ModelSerializer):
+    participant = SimpleParticipationSerializer()
+    created_by = SimpleUserSerializer()
+
+    class Meta:
+        model = TimeEntry
+        fields = ('participant', 'created_by')
+
+
+class SkillsApprovalSerializer(serializers.ModelSerializer):
+    created_by = SimpleUserSerializer(required=False, read_only=True, default=CreateOnlyCurrentUserDefault())
+
+    class Meta:
+        model = SkillsApproval
+        fields = '__all__'
+        details_serializer = SkillsApprovalDetailsSerializer

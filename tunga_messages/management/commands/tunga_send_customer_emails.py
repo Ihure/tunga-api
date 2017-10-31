@@ -1,3 +1,5 @@
+# -*- coding: utf-8 -*-
+
 import datetime
 
 from actstream.models import Action
@@ -63,6 +65,6 @@ class Command(BaseCommand):
                         'channel_url': '%s/customer/help/%s/' % (TUNGA_URL, channel.id)
                     }
 
-                    if send_mail(subject, 'tunga/email/email_unread_help_messages', to, ctx):
+                    if send_mail(subject, 'tunga/email/unread_help_messages', to, ctx):
                         channel.last_read = channel.latest_message
                         channel.save()

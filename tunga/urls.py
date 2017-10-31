@@ -27,6 +27,7 @@ from tunga_auth.views import VerifyUserView, AccountInfoView, UserViewSet, socia
     slack_connect_callback, harvest_connect_callback, EmailVisitorView, github_connect_callback
 from tunga_comments.views import CommentViewSet
 from tunga_messages.views import MessageViewSet, ChannelViewSet, slack_customer_notification
+from tunga_pages.views import SkillPageViewSet
 from tunga_profiles.views import ProfileView, EducationViewSet, WorkViewSet, ConnectionViewSet, \
     NotificationView, CountryListView, DeveloperApplicationViewSet, RepoListView, IssueListView, SlackIntegrationView, \
     HarvestAPIView, DeveloperInvitationViewSet
@@ -34,8 +35,9 @@ from tunga_settings.views import UserSettingsView
 from tunga_support.views import SupportPageViewSet, SupportSectionViewSet
 from tunga_tasks.views import TaskViewSet, ApplicationViewSet, ParticipationViewSet, TimeEntryViewSet, ProjectViewSet, \
     ProgressReportViewSet, ProgressEventViewSet, \
-    coinbase_notification, bitpesa_notification, EstimateViewSet, QuoteViewSet
-from tunga_utils.views import SkillViewSet, ContactRequestView
+    coinbase_notification, bitpesa_notification, EstimateViewSet, QuoteViewSet, MultiTaskPaymentKeyViewSet, \
+    TaskPaymentViewSet, ParticipantPaymentViewSet, SkillsApprovalViewSet, SprintViewSet
+from tunga_utils.views import SkillViewSet, ContactRequestView, get_medium_posts
 
 api_schema_view = get_swagger_view(title='Tunga API')
 
@@ -49,6 +51,7 @@ router.register(r'application', ApplicationViewSet)
 router.register(r'participation', ParticipationViewSet)
 router.register(r'estimate', EstimateViewSet)
 router.register(r'quote', QuoteViewSet)
+router.register(r'sprint', SprintViewSet)
 router.register(r'time-entry', TimeEntryViewSet)
 router.register(r'progress-event', ProgressEventViewSet)
 router.register(r'progress-report', ProgressReportViewSet)
@@ -62,6 +65,11 @@ router.register(r'activity', ActionViewSet)
 router.register(r'skill', SkillViewSet)
 router.register(r'support/section', SupportSectionViewSet)
 router.register(r'support/page', SupportPageViewSet)
+router.register(r'multi-task-payment', MultiTaskPaymentKeyViewSet)
+router.register(r'task-payment', TaskPaymentViewSet)
+router.register(r'participant-payment', ParticipantPaymentViewSet)
+router.register(r'skill-page', SkillPageViewSet)
+router.register(r'skill-approval', SkillsApprovalViewSet)
 
 urlpatterns = [
     url(r'^admin/', admin.site.urls),
@@ -99,6 +107,7 @@ urlpatterns = [
     url(r'api/', include('rest_framework.urls', namespace='rest_framework')),
     url(r'^api/countries/', CountryListView.as_view(), name='countries'),
     url(r'^api/contact-request/', ContactRequestView.as_view(), name='contact-request'),
+    url(r'^api/medium/', get_medium_posts, name='medium-posts'),
     url(r'^api/docs/', api_schema_view),
     url(r'^reset-password/confirm/(?P<uidb64>[0-9A-Za-z_\-]+)/(?P<token>[0-9A-Za-z]{1,13}-[0-9A-Za-z]{1,20})/$',
         password_reset_confirm, name='password_reset_confirm'),

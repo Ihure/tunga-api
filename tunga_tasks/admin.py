@@ -1,8 +1,19 @@
+# -*- coding: utf-8 -*-
+
 from django.contrib import admin
 
 from tunga_tasks.models import Task, Application, Participation, TimeEntry, ProgressEvent, ProgressReport, \
-    Project, TaskPayment, ParticipantPayment, TaskInvoice, TaskAccess, Estimate, Quote, WorkActivity
+    Project, TaskPayment, ParticipantPayment, TaskInvoice, TaskAccess, Estimate, Quote, WorkActivity, \
+    MultiTaskPaymentKey
 from tunga_utils.admin import ReadOnlyModelAdmin
+
+
+@admin.register(MultiTaskPaymentKey)
+class MultiTaskPaymentKeyAdmin(admin.ModelAdmin):
+    pass
+    #list_display = ('title', 'amount', 'closed', 'created_at', 'archived')
+    #list_filter = ('archived',)
+    #search_fields = ('title',)
 
 
 @admin.register(Project)
@@ -12,7 +23,7 @@ class ProjectAdmin(admin.ModelAdmin):
     search_fields = ('title',)
 
 
-class TaskAccessInline(admin.TabularInline):
+class TaskAccessInline(admin.StackedInline):
     model = TaskAccess
     exclude = ('created_by',)
     extra = 1
@@ -22,7 +33,7 @@ class TaskAccessInline(admin.TabularInline):
         obj.save()
 
 
-class ParticipationInline(admin.TabularInline):
+class ParticipationInline(admin.StackedInline):
     model = Participation
     exclude = ('created_by',)
     extra = 1
@@ -35,11 +46,15 @@ class ParticipationInline(admin.TabularInline):
 @admin.register(Task)
 class TaskAdmin(admin.ModelAdmin):
     list_display = (
-        'summary', 'user', 'type', 'scope', 'source', 'apply', 'closed', 'archived', 'skills_list', 'created_at',
-        'fee', 'bid', 'dev_rate', 'pm_rate', 'pm_time_percentage', 'tunga_percentage_dev', 'tunga_percentage_pm'
+        'summary', 'user', 'type', 'scope', 'source', 'apply', 'closed', 'paid', 'archived', 'skills_list', 'created_at',
+        'fee', 'bid', 'dev_rate', 'pm_rate', 'pm_time_percentage', 'tunga_percentage_dev', 'tunga_percentage_pm',
+        'schedule_call_start'
     )
-    list_filter = ('type', 'scope', 'source', 'apply', 'closed', 'paid', 'pay_distributed', 'archived')
-    search_fields = ('title',)
+    list_filter = (
+        'type', 'scope', 'source', 'apply', 'closed', 'paid', 'pay_distributed', 'archived',
+        'created_at', 'schedule_call_start', 'paid_at'
+    )
+    search_fields = ('title', 'analytics_id')
     inlines = (TaskAccessInline, ParticipationInline)
 
     def save_formset(self, request, form, formset, change):
@@ -52,14 +67,14 @@ class TaskAdmin(admin.ModelAdmin):
 
 @admin.register(Application)
 class ApplicationAdmin(admin.ModelAdmin):
-    list_display = ('task', 'user', 'responded', 'accepted', 'created_at')
-    list_filter = ('accepted', 'created_at')
+    list_display = ('task', 'user', 'status', 'created_at')
+    list_filter = ('status', 'created_at')
 
 
 @admin.register(Participation)
 class ParticipationAdmin(admin.ModelAdmin):
-    list_display = ('task', 'user', 'responded', 'accepted', 'share', 'created_at')
-    list_filter = ('accepted', 'created_at')
+    list_display = ('task', 'user', 'status', 'share', 'created_at')
+    list_filter = ('status', 'created_at')
 
 
 @admin.register(Estimate)
@@ -96,8 +111,9 @@ class ProgressReportAdmin(admin.ModelAdmin):
 
 @admin.register(TaskPayment)
 class TaskPaymentAdmin(ReadOnlyModelAdmin):
-    list_display = ('task', 'btc_address', 'btc_received', 'ref', 'btc_price', 'processed', 'created_at', 'received_at')
+    list_display = ('task', 'payment_type', 'ref', 'btc_address', 'btc_received', 'btc_price', 'amount', 'currency', 'email', 'paid', 'captured', 'processed', 'created_at', 'received_at')
     list_filter = ('processed', 'created_at', 'received_at')
+    search_fields = ('task__title',)
 
 
 @admin.register(ParticipantPayment)
@@ -107,10 +123,14 @@ class ParticipantPaymentAdmin(ReadOnlyModelAdmin):
         'destination', 'ref', 'status', 'created_at', 'received_at'
     )
     list_filter = ('status', 'created_at', 'received_at')
+    search_fields = (
+        'participant__user__username', 'participant__user__first_name',
+        'participant__user__last_name', 'participant__task__title'
+    )
 
 
 @admin.register(TaskInvoice)
 class TaskInvoiceAdmin(ReadOnlyModelAdmin):
     list_display = ('number', 'task', 'display_fee', 'payment_method', 'created_at')
     list_filter = ('payment_method', 'created_at')
-    search_fields = ('number',)
+    search_fields = ('number', 'task__title')

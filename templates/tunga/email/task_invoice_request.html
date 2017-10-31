@@ -1,0 +1,28 @@
+{% extends "tunga/email/content.html" %}
+{% load i18n %}
+{% block email_header %}
+    {{ owner.display_name }} requested for an invoice.
+{% endblock %}
+{% block email_content %}
+    <p>Hello,</p>
+
+    <p>{{ user.display_name }} generated an invoice.</p>
+
+    <p>
+        {% if task.is_task %}Task{% else %}Project{% endif %}: {{ task.summary }}<br/>
+        Client: {{ owner.display_name }}
+        Fee: {{ invoice.display_fee }}
+        Payment method: {{ invoice.get_payment_method_display }}
+    </p>
+
+    <p>
+        Click the link below to get a copy of the invoice:<br/>
+        <a href="{{ invoice_url }}">{{ invoice_url }}</a>
+    </p>
+
+    <p>
+        Click the link below to view the task's details:<br/>
+        <a href="{{ task_url }}">{{ task_url }}</a>
+    </p>
+
+{% endblock %}

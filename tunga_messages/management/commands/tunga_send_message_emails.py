@@ -1,3 +1,5 @@
+# -*- coding: utf-8 -*-
+
 import datetime
 
 from dateutil.parser import parse
@@ -8,7 +10,7 @@ from django.db.models.expressions import Case, When, F
 from django.db.models.fields import IntegerField
 from django.db.models.query_utils import Q
 
-from tunga.settings import EMAIL_SUBJECT_PREFIX, TUNGA_URL
+from tunga.settings import TUNGA_URL
 from tunga_activity import verbs
 from tunga_messages.models import ChannelUser
 from tunga_utils.constants import CHANNEL_TYPE_DIRECT
@@ -51,12 +53,13 @@ class Command(BaseCommand):
 
             to = [user_channel.user.email]
             if user_channel.channel.type == CHANNEL_TYPE_DIRECT:
-                conversation_subject = "New message%s from %s" % (
-                    user_channel.new_messages == 1 and '' or 's', channel_name
+                conversation_subject = "New message{} from {}".format(
+                    user_channel.new_messages == 1 and '' or 's',
+                    channel_name
                 )
             else:
-                conversation_subject = "Conversation: %s" % channel_name
-            subject = "%s %s" % (EMAIL_SUBJECT_PREFIX, conversation_subject)
+                conversation_subject = "Conversation: {}".format(channel_name)
+            subject = conversation_subject
             ctx = {
                 'receiver': user_channel.user,
                 'new_messages': user_channel.new_messages,
@@ -65,6 +68,6 @@ class Command(BaseCommand):
                 'channel_url': '%s/conversation/%s/' % (TUNGA_URL, user_channel.channel.id)
             }
 
-            if send_mail(subject, 'tunga/email/email_unread_channel_messages', to, ctx):
+            if send_mail(subject, 'tunga/email/unread_channel_messages', to, ctx):
                 user_channel.last_email_at = datetime.datetime.utcnow()
                 user_channel.save()

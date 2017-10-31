@@ -3,6 +3,7 @@ import json
 from allauth.socialaccount.providers.github.provider import GitHubProvider
 from django.db.models.query_utils import Q
 from django.shortcuts import get_object_or_404
+from django.utils import six
 from django_countries.fields import CountryField
 from dry_rest_permissions.generics import DRYObjectPermissions, DRYPermissions
 from rest_framework import viewsets, generics, views, status
@@ -25,7 +26,7 @@ from tunga_tasks.utils import get_integration_token
 from tunga_utils import github, harvest_utils, slack_utils
 from tunga_utils.constants import USER_TYPE_PROJECT_OWNER, APP_INTEGRATION_PROVIDER_SLACK, CHANNEL_TYPE_SUPPORT, \
     CHANNEL_TYPE_DIRECT, CHANNEL_TYPE_TOPIC, CHANNEL_TYPE_DEVELOPER, APP_INTEGRATION_PROVIDER_HARVEST, \
-    TASK_SCOPE_ONGOING, TASK_SCOPE_PROJECT, TASK_SOURCE_NEW_USER, STATUS_ACCEPTED
+    TASK_SCOPE_ONGOING, TASK_SCOPE_PROJECT, TASK_SOURCE_NEW_USER, STATUS_ACCEPTED, STATUS_INITIAL, STATUS_REJECTED
 from tunga_utils.filterbackends import DEFAULT_FILTER_BACKENDS
 
 
@@ -202,15 +203,16 @@ class NotificationView(views.APIView):
         }
 
         channel_type_summary_updates = dict()
-        for channel_type_name in channel_type_map.itervalues():
+        for channel_type_name in six.itervalues(channel_type_map):
             channel_type_summary_updates[channel_type_name] = 0
 
         for channel in channel_updates:
             channel_type_summary_updates[channel_type_map.get(channel['type'], '')] += channel['new']
 
-        requests = user.connection_requests.filter(responded=False, from_user__pending=False).count()
-        tasks = user.tasks_created.filter(closed=False).count() + user.participation_set.filter(
-            (Q(accepted=True) | Q(responded=False)), task__closed=False, user=user
+        requests = user.connection_requests.filter(status=STATUS_INITIAL, from_user__pending=False).count()
+        tasks = user.tasks_created.filter(closed=False).count() + user.participation_set.exclude(
+            status=STATUS_REJECTED).filter(
+            task__closed=False, user=user
         ).count() + user.tasks_managed.filter(closed=False).count()
         pm_tasks = Task.objects.filter(
             Q(scope=TASK_SCOPE_ONGOING) |
